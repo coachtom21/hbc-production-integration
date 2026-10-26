@@ -407,7 +407,7 @@ final class HBC_Prod_Admin {
 		self::row( 'Seed event code', 'STONE' );
 		self::row( 'Practice FAITH event', HBC_Prod_Store::faith_event_uuid() );
 		self::row( 'Trade', $trade );
-		self::row( '$12 checkout', 'https://www.megavoters.com/discover/' );
+		self::row( '$12 checkout', HBC_Production_Adapters::miner_checkout_url() );
 		self::row( 'Last orphan sweep', (string) get_option( 'hbc_prod_last_sweep', 'not yet' ) );
 		self::row( 'Universal entry', home_url( '/r' ) );
 		self::row( 'Organize', home_url( '/organize' ) );

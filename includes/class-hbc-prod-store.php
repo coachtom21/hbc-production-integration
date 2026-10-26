@@ -525,6 +525,7 @@ final class HBC_Prod_Store {
 			return;
 		}
 		if ( self::host_uuid() && $wpdb->get_var( $wpdb->prepare( "SELECT host_uuid FROM {$hosts} WHERE host_uuid = %s", self::host_uuid() ) ) ) {
+			self::ensure_open_published_events( self::host_uuid() );
 			return;
 		}
 
@@ -631,6 +632,74 @@ final class HBC_Prod_Store {
 		update_option( 'hbc_prod_host_assignment_uuid', $assign_uuid, false );
 		update_option( self::TRADE_OPTION, 'locked', false );
 		self::bind_first_admin();
+	}
+
+	/**
+	 * /r only lists published events whose RSVP is still open. The pilot seed
+	 * closes RSVP after 30 days, which empties the scan list. When nothing is
+	 * open, extend those published RSVP windows. Create one event only when
+	 * this host has no published event at all.
+	 */
+	public static function ensure_open_published_events( string $host_uuid ): void {
+		global $wpdb;
+		$table = $wpdb->prefix . 'hbc_events';
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+			return;
+		}
+		$open = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE status = 'published' AND (rsvp_closes_at IS NULL OR rsvp_closes_at >= UTC_TIMESTAMP())" );
+		if ( $open > 0 ) {
+			return;
+		}
+		$closed = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE status = 'published' AND rsvp_closes_at IS NOT NULL AND rsvp_closes_at < UTC_TIMESTAMP()" );
+		if ( $closed > 0 ) {
+			$close = gmdate( 'Y-m-d H:i:s', strtotime( '+90 days' ) );
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table} SET rsvp_closes_at = %s, updated_at = %s WHERE status = 'published' AND rsvp_closes_at IS NOT NULL AND rsvp_closes_at < UTC_TIMESTAMP()",
+					$close,
+					self::now()
+				)
+			);
+			return;
+		}
+		if ( self::is_uuid( $host_uuid ) && self::get_host( $host_uuid ) ) {
+			self::insert_open_pilot_event( $host_uuid );
+		}
+	}
+
+	/**
+	 * One published gathering so /r has an event to select.
+	 */
+	private static function insert_open_pilot_event( string $host_uuid ): void {
+		global $wpdb;
+		$now   = self::now();
+		$start = gmdate( 'Y-m-d H:i:s', strtotime( '+7 days 18:00' ) );
+		$end   = gmdate( 'Y-m-d H:i:s', strtotime( '+7 days 21:00' ) );
+		$open  = gmdate( 'Y-m-d H:i:s', strtotime( '-1 day' ) );
+		$close = gmdate( 'Y-m-d H:i:s', strtotime( '+90 days' ) );
+		$wpdb->insert(
+			$wpdb->prefix . 'hbc_events',
+			array(
+				'event_uuid'        => self::uuid(),
+				'host_uuid'         => $host_uuid,
+				'name'              => 'Human Gold Pilot gathering',
+				'event_type'        => 'community',
+				'description'       => 'Observe or Participate. A scan is not presence.',
+				'starts_at'         => $start,
+				'ends_at'           => $end,
+				'location'          => 'Stone Mountain, Georgia',
+				'capacity'          => 40,
+				'allow_observe'     => 1,
+				'allow_participate' => 1,
+				'volunteer_message' => 'Participate also records a volunteer request.',
+				'route_mode'        => 'universal',
+				'status'            => 'published',
+				'rsvp_opens_at'     => $open,
+				'rsvp_closes_at'    => $close,
+				'created_at'        => $now,
+				'updated_at'        => $now,
+			)
+		);
 	}
 
 	public static function bind_first_admin(): void {

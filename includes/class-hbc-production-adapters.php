@@ -153,15 +153,48 @@ final class HBC_Production_Adapters {
 			$out['organization'] = array( 'name' => $host->name );
 		}
 		if ( $operator && is_array( $assignment ) ) {
-			$out['assignment_uuid'] = $assignment['assignment_uuid'];
-			$out['operator_role']   = $assignment['role'];
-			$out['trade_available'] = HBC_Prod_Store::can_offer_trade( (string) $identity );
+			$authorization = array(
+				'assignment_uuid' => $assignment['assignment_uuid'],
+				'role'            => $assignment['role'],
+			);
+			if ( $assignment['role'] === 'host' ) {
+				$authorization['dashboard_url'] = home_url( '/organize/' );
+			}
+			$out['assignment_uuid']  = $assignment['assignment_uuid'];
+			$out['operator_role']    = $assignment['role'];
+			$out['authorizations']   = array( $authorization );
+			$out['acting_as']        = $authorization;
+			$out['trade_available']  = HBC_Prod_Store::can_offer_trade( (string) $identity );
+			$out['fallback_rsvp']    = array(
+				'event'           => $out['event'],
+				'allowed_actions' => array( 'observe', 'participate', 'walk_away' ),
+			);
 			$out['not_now_fallback'] = array(
 				'route_view'      => 'respondent_rsvp',
 				'allowed_actions' => array( 'observe', 'participate', 'walk_away' ),
 			);
 		}
 		return $out;
+	}
+
+	/**
+	 * Paid Memberships Pro checkout for the $12 Miner level on this site.
+	 */
+	public static function miner_checkout_url(): string {
+		$level_id = 2;
+		if ( class_exists( 'Cpm_Humanblockchain_Membership' ) ) {
+			$mapped = (int) Cpm_Humanblockchain_Membership::get_pmpro_level_id_for_tier( 'megavoter' );
+			if ( $mapped > 0 ) {
+				$level_id = $mapped;
+			}
+		}
+		if ( function_exists( 'pmpro_url' ) ) {
+			$url = pmpro_url( 'checkout', 'level=' . $level_id );
+			if ( is_string( $url ) && $url !== '' ) {
+				return $url;
+			}
+		}
+		return add_query_arg( 'level', (string) $level_id, home_url( '/membership-checkout/' ) );
 	}
 
 	public static function begin_registration( $default, $payload ) {
@@ -547,10 +580,9 @@ final class HBC_Production_Adapters {
 		if ( $user_id ) {
 			update_user_meta( $user_id, 'hbc_membership_checkout_pending', 1 );
 		}
-		// Public contract requires megavoters.com HTTPS. $12 stays the only public payment.
 		return array(
 			'status'       => 'checkout_required',
-			'checkout_url' => 'https://www.megavoters.com/discover/',
+			'checkout_url' => self::miner_checkout_url(),
 		);
 	}
 
