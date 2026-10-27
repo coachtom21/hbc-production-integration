@@ -1528,6 +1528,64 @@ final class HBC_Prod_Store {
 		return self::is_uuid( (string) $uuid ) ? (string) $uuid : false;
 	}
 
+	/**
+	 * Registered phones and browsers for the Human Gold admin list.
+	 * The recognition token itself is not included.
+	 *
+	 * @return list<array<string, string>>
+	 */
+	public static function list_saved_devices(): array {
+		global $wpdb;
+		$devices = $wpdb->prefix . 'hbc_devices';
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $devices ) ) !== $devices ) {
+			return array();
+		}
+		$rows = $wpdb->get_results(
+			"SELECT d.device_uuid, d.identity_uuid, d.status, d.verified_at, d.last_seen_at,
+				i.email_ciphertext, i.phone_ciphertext
+			FROM {$devices} d
+			LEFT JOIN {$wpdb->prefix}hbc_identities i ON i.identity_uuid = d.identity_uuid
+			ORDER BY d.verified_at DESC
+			LIMIT 200"
+		);
+		$host_ids = $wpdb->get_col(
+			"SELECT identity_uuid FROM {$wpdb->prefix}hbc_host_assignments
+			WHERE role_key = 'host' AND revoked_at IS NULL"
+		);
+		$host_ids = is_array( $host_ids ) ? $host_ids : array();
+		$out      = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$email = self::unseal( (string) ( $row->email_ciphertext ?? '' ) );
+			$phone = self::unseal( (string) ( $row->phone_ciphertext ?? '' ) );
+			$user  = self::wp_user_for_identity( (string) $row->identity_uuid );
+			$account = $email;
+			if ( $user > 0 ) {
+				$wp_user = get_userdata( $user );
+				if ( $wp_user && is_email( $wp_user->user_email ) ) {
+					$account = (string) $wp_user->user_email;
+				}
+			}
+			if ( $account === '' ) {
+				$account = 'Unknown';
+			}
+			$digits = preg_replace( '/\D/', '', $phone );
+			$masked = '—';
+			if ( is_string( $digits ) && strlen( $digits ) >= 4 ) {
+				$masked = '••••' . substr( $digits, -4 );
+			}
+			$role = in_array( (string) $row->identity_uuid, $host_ids, true ) ? 'Host' : 'Guest';
+			$out[] = array(
+				'account'      => $account,
+				'phone'        => $masked,
+				'role'         => $role,
+				'status'       => (string) $row->status,
+				'verified_at'  => (string) ( $row->verified_at ?: '—' ),
+				'last_seen_at' => (string) ( $row->last_seen_at ?: '—' ),
+			);
+		}
+		return $out;
+	}
+
 	public static function device_for_identity( string $identity_uuid ): ?object {
 		global $wpdb;
 		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}hbc_devices WHERE identity_uuid = %s AND status = 'active' ORDER BY last_seen_at DESC LIMIT 1", $identity_uuid ) );
@@ -1602,18 +1660,31 @@ final class HBC_Prod_Store {
 	public static function bind_admin_host_if_needed( string $identity_uuid ): void {
 		global $wpdb;
 		$host = self::host_uuid();
-		if ( $host === '' ) {
+		if ( $host === '' || ! self::is_uuid( $identity_uuid ) ) {
+			return;
+		}
+		$table = $wpdb->prefix . 'hbc_host_assignments';
+		$row   = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT assignment_uuid, identity_uuid FROM {$table}
+				WHERE host_uuid = %s AND role_key = 'host' AND revoked_at IS NULL
+				ORDER BY starts_at DESC LIMIT 1",
+				$host
+			)
+		);
+		if ( ! $row || (string) $row->identity_uuid === $identity_uuid ) {
 			return;
 		}
 		$placeholder = '00000000-0000-4000-8000-000000000001';
+		// A host phone that already registered keeps the role. A placeholder or
+		// an admin identity with no device can be replaced by this registration.
+		if ( (string) $row->identity_uuid !== $placeholder && self::device_for_identity( (string) $row->identity_uuid ) ) {
+			return;
+		}
 		$wpdb->update(
-			$wpdb->prefix . 'hbc_host_assignments',
+			$table,
 			array( 'identity_uuid' => $identity_uuid ),
-			array(
-				'host_uuid'     => $host,
-				'identity_uuid' => $placeholder,
-				'role_key'      => 'host',
-			)
+			array( 'assignment_uuid' => $row->assignment_uuid )
 		);
 	}
 
