@@ -1575,6 +1575,7 @@ final class HBC_Prod_Store {
 			}
 			$role = in_array( (string) $row->identity_uuid, $host_ids, true ) ? 'Host' : 'Guest';
 			$out[] = array(
+				'device_uuid'  => (string) $row->device_uuid,
 				'account'      => $account,
 				'phone'        => $masked,
 				'role'         => $role,
@@ -1584,6 +1585,82 @@ final class HBC_Prod_Store {
 			);
 		}
 		return $out;
+	}
+
+	/**
+	 * Active host identity for an organization.
+	 */
+	public static function active_host_identity( string $host_uuid ): string {
+		global $wpdb;
+		if ( ! self::is_uuid( $host_uuid ) ) {
+			return '';
+		}
+		$identity = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT identity_uuid FROM {$wpdb->prefix}hbc_host_assignments
+				WHERE host_uuid = %s AND role_key = 'host' AND revoked_at IS NULL
+				AND starts_at <= UTC_TIMESTAMP() AND (ends_at IS NULL OR ends_at >= UTC_TIMESTAMP())
+				ORDER BY starts_at DESC LIMIT 1",
+				$host_uuid
+			)
+		);
+		return is_string( $identity ) && self::is_uuid( $identity ) ? $identity : '';
+	}
+
+	/**
+	 * A browser tab for a logged-in administrator who can manage this event.
+	 * The host phone keeps its own device. The previous admin tab for this user is revoked.
+	 */
+	public static function console_encounter_token( string $event_uuid, int $user_id ): string {
+		global $wpdb;
+		if ( $user_id <= 0 || ! self::is_uuid( $event_uuid ) ) {
+			return '';
+		}
+		$event = self::get_event( $event_uuid );
+		if ( ! $event || (string) $event->status !== 'published' ) {
+			return '';
+		}
+		if ( ! apply_filters( 'hbc_user_can_access_host', false, $user_id, (string) $event->host_uuid ) ) {
+			return '';
+		}
+		$identity = self::active_host_identity( (string) $event->host_uuid );
+		if ( $identity === '' || $identity === '00000000-0000-4000-8000-000000000001' ) {
+			return '';
+		}
+		$previous = (string) get_user_meta( $user_id, 'hbc_admin_console_device', true );
+		if ( self::is_uuid( $previous ) ) {
+			self::revoke_device( $previous );
+		}
+		$token = self::issue_device_token( $identity );
+		if ( $token === '' ) {
+			return '';
+		}
+		$device_uuid = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT device_uuid FROM {$wpdb->prefix}hbc_devices WHERE recognition_token_hash = %s LIMIT 1",
+				self::hash_token( $token )
+			)
+		);
+		if ( is_string( $device_uuid ) && self::is_uuid( $device_uuid ) ) {
+			update_user_meta( $user_id, 'hbc_admin_console_device', $device_uuid );
+		}
+		return $token;
+	}
+
+	public static function revoke_device( string $device_uuid ): bool {
+		global $wpdb;
+		if ( ! self::is_uuid( $device_uuid ) ) {
+			return false;
+		}
+		$updated = $wpdb->update(
+			$wpdb->prefix . 'hbc_devices',
+			array( 'status' => 'revoked' ),
+			array(
+				'device_uuid' => $device_uuid,
+				'status'      => 'active',
+			)
+		);
+		return false !== $updated && $updated > 0;
 	}
 
 	public static function device_for_identity( string $identity_uuid ): ?object {
@@ -1607,6 +1684,7 @@ final class HBC_Prod_Store {
 					array( 'identity_uuid' => $existing->identity_uuid )
 				);
 			}
+			self::attach_identity_user( (string) $existing->identity_uuid, $wp_user_id );
 			return array(
 				'identity_uuid' => $existing->identity_uuid,
 				'created'       => false,
@@ -1631,30 +1709,139 @@ final class HBC_Prod_Store {
 				'created_at'        => $now,
 			)
 		);
-		if ( $wp_user_id > 0 ) {
-			update_user_meta( $wp_user_id, 'hbc_identity_uuid', $identity_uuid );
-		}
+		self::attach_identity_user( $identity_uuid, $wp_user_id );
 		return array(
 			'identity_uuid' => $identity_uuid,
 			'created'       => true,
 		);
 	}
 
-	public static function issue_device_token( string $identity_uuid ): string {
-		global $wpdb;
-		$token = 'dvt_' . bin2hex( random_bytes( 24 ) );
-		$wpdb->insert(
-			$wpdb->prefix . 'hbc_devices',
+	/**
+	 * Tie this identity to the account that just verified the phone.
+	 * An administrator replaces any earlier account on the same phone.
+	 */
+	private static function attach_identity_user( string $identity_uuid, int $wp_user_id ): void {
+		if ( $wp_user_id <= 0 || ! self::is_uuid( $identity_uuid ) ) {
+			return;
+		}
+		update_user_meta( $wp_user_id, 'hbc_identity_uuid', $identity_uuid );
+		if ( ! user_can( $wp_user_id, 'manage_options' ) && ! user_can( $wp_user_id, 'hbc_super_admin' ) ) {
+			return;
+		}
+		$others = get_users(
 			array(
-				'device_uuid'             => self::uuid(),
-				'identity_uuid'           => $identity_uuid,
-				'recognition_token_hash'  => self::hash_token( $token ),
-				'verified_at'             => self::now(),
-				'last_seen_at'            => self::now(),
-				'status'                  => 'active',
+				'meta_key'   => 'hbc_identity_uuid',
+				'meta_value' => $identity_uuid,
+				'exclude'    => array( $wp_user_id ),
+				'fields'     => 'ID',
 			)
 		);
+		foreach ( $others as $other_id ) {
+			delete_user_meta( (int) $other_id, 'hbc_identity_uuid' );
+		}
+	}
+
+	public static function issue_device_token( string $identity_uuid ): string {
+		global $wpdb;
+		$table = $wpdb->prefix . 'hbc_devices';
+		self::ensure_rsvp_device_columns( $table );
+
+		$token = 'dvt_' . bin2hex( random_bytes( 24 ) );
+		$now   = self::now();
+		$wanted = array(
+			'device_uuid'            => self::uuid(),
+			'identity_uuid'          => $identity_uuid,
+			'recognition_token_hash' => self::hash_token( $token ),
+			'verified_at'            => $now,
+			'last_seen_at'           => $now,
+			'status'                 => 'active',
+			'device_hash'            => hash( 'sha256', 'hbc-device|' . $token ),
+			'platform'               => 'rsvp-browser',
+			'registered_at'          => $now,
+		);
+
+		$columns = $wpdb->get_results( "SHOW COLUMNS FROM {$table}", ARRAY_A );
+		if ( ! is_array( $columns ) || ! $columns ) {
+			update_option( 'hbc_last_device_insert_error', 'Devices table is missing.', false );
+			return '';
+		}
+
+		$present = array();
+		foreach ( $columns as $col ) {
+			if ( isset( $col['Field'] ) ) {
+				$present[ (string) $col['Field'] ] = $col;
+			}
+		}
+
+		$row = array();
+		foreach ( $wanted as $name => $value ) {
+			if ( isset( $present[ $name ] ) ) {
+				$row[ $name ] = $value;
+			}
+		}
+		foreach ( $present as $name => $col ) {
+			if ( array_key_exists( $name, $row ) ) {
+				continue;
+			}
+			$nullable    = ( (string) ( $col['Null'] ?? '' ) ) === 'YES';
+			$has_default = array_key_exists( 'Default', $col ) && null !== $col['Default'];
+			$extra       = (string) ( $col['Extra'] ?? '' );
+			if ( $nullable || $has_default || false !== strpos( $extra, 'auto_increment' ) ) {
+				continue;
+			}
+			$type = strtolower( (string) ( $col['Type'] ?? '' ) );
+			if ( preg_match( "/^enum\\('([^']*)'/", $type, $match ) ) {
+				$row[ $name ] = $match[1];
+			} elseif ( false !== strpos( $type, 'date' ) || false !== strpos( $type, 'time' ) ) {
+				$row[ $name ] = $now;
+			} elseif ( preg_match( '/int|decimal|float|double/', $type ) ) {
+				$row[ $name ] = 0;
+			} else {
+				$row[ $name ] = '';
+			}
+		}
+
+		if ( empty( $row['recognition_token_hash'] ) || empty( $row['identity_uuid'] ) ) {
+			update_option( 'hbc_last_device_insert_error', 'Devices table has no place to store the recognition token.', false );
+			return '';
+		}
+
+		$saved = $wpdb->insert( $table, $row );
+		if ( false === $saved ) {
+			update_option( 'hbc_last_device_insert_error', $wpdb->last_error !== '' ? $wpdb->last_error : 'Insert failed.', false );
+			return '';
+		}
+		delete_option( 'hbc_last_device_insert_error' );
 		return $token;
+	}
+
+	/**
+	 * RSVP recognition and the older device registry share wp_hbc_devices.
+	 * Add a missing column rather than failing the insert on one site's shape.
+	 */
+	private static function ensure_rsvp_device_columns( string $table ): void {
+		global $wpdb;
+		$existing = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
+		if ( ! is_array( $existing ) ) {
+			return;
+		}
+		$add = array(
+			'device_uuid'            => 'CHAR(36) NULL',
+			'identity_uuid'          => 'CHAR(36) NULL',
+			'recognition_token_hash' => 'CHAR(64) NULL',
+			'verified_at'            => 'DATETIME NULL',
+			'last_seen_at'           => 'DATETIME NULL',
+			'status'                 => "VARCHAR(24) NOT NULL DEFAULT 'active'",
+			'device_hash'            => 'CHAR(64) NULL',
+			'platform'               => 'VARCHAR(50) NULL',
+			'registered_at'          => 'DATETIME NULL',
+		);
+		foreach ( $add as $name => $definition ) {
+			if ( in_array( $name, $existing, true ) ) {
+				continue;
+			}
+			$wpdb->query( "ALTER TABLE {$table} ADD COLUMN {$name} {$definition}" );
+		}
 	}
 
 	public static function bind_admin_host_if_needed( string $identity_uuid ): void {
@@ -1686,6 +1873,609 @@ final class HBC_Prod_Store {
 			array( 'identity_uuid' => $identity_uuid ),
 			array( 'assignment_uuid' => $row->assignment_uuid )
 		);
+	}
+
+	/**
+	 * Save this verified phone as the organizer of its own organization.
+	 * Does not replace an existing host, and does not change the site-wide Trade switch.
+	 *
+	 * @param array<string, mixed> $payload Organization name, type, and optional public code.
+	 * @return array<string, mixed>
+	 */
+	public static function save_phone_as_organizer( string $identity_uuid, array $payload = array() ): array {
+		global $wpdb;
+		if ( ! self::is_uuid( $identity_uuid ) || $identity_uuid === '00000000-0000-4000-8000-000000000001' ) {
+			return array(
+				'error' => array(
+					'code'    => 'identity_required',
+					'message' => 'Verify this phone before becoming the host.',
+				),
+			);
+		}
+		if ( ! self::device_for_identity( $identity_uuid ) ) {
+			return array(
+				'error' => array(
+					'code'    => 'device_required',
+					'message' => 'This phone is not saved on this device yet.',
+				),
+			);
+		}
+		$rsvp = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT rsvp_uuid FROM {$wpdb->prefix}hbc_rsvps
+				WHERE identity_uuid = %s AND status = 'completed'
+				AND rsvp_choice IN ('observe','participate')
+				LIMIT 1",
+				$identity_uuid
+			)
+		);
+		if ( ! is_string( $rsvp ) || $rsvp === '' ) {
+			return array(
+				'error' => array(
+					'code'    => 'rsvp_required',
+					'message' => 'Choose Observe or Participate before becoming the host.',
+				),
+			);
+		}
+
+		$existing = self::active_host_organization( $identity_uuid );
+		if ( $existing ) {
+			return self::organizer_payload( $existing, true );
+		}
+		if ( ! class_exists( 'HBC_Prod_Orgs' ) ) {
+			return array(
+				'error' => array(
+					'code'    => 'host_save_failed',
+					'message' => 'This phone could not be saved as the organizer.',
+				),
+			);
+		}
+
+		$name = sanitize_text_field( (string) ( $payload['name'] ?? '' ) );
+		$type = sanitize_key( (string) ( $payload['type'] ?? 'church' ) );
+		if ( ! in_array( $type, array( 'church', 'community', 'nonprofit' ), true ) ) {
+			$type = 'church';
+		}
+		$created = HBC_Prod_Orgs::register_organization(
+			array(
+				'name'        => $name,
+				'type'        => $type,
+				'public_code' => (string) ( $payload['public_code'] ?? '' ),
+			),
+			self::wp_user_for_identity( $identity_uuid )
+		);
+		if ( ! empty( $created['error'] ) ) {
+			return $created;
+		}
+		$host_uuid = (string) ( $created['host_uuid'] ?? '' );
+		if ( ! self::ensure_host_assignment( $host_uuid, $identity_uuid ) ) {
+			return array(
+				'error' => array(
+					'code'    => 'host_save_failed',
+					'message' => 'This phone could not be saved as the organizer.',
+				),
+			);
+		}
+		$saved = self::active_host_organization( $identity_uuid );
+		if ( ! $saved ) {
+			return array(
+				'error' => array(
+					'code'    => 'host_save_failed',
+					'message' => 'This phone could not be saved as the organizer.',
+				),
+			);
+		}
+		return self::organizer_payload( $saved, false );
+	}
+
+	/**
+	 * @return object|null
+	 */
+	private static function active_host_organization( string $identity_uuid ) {
+		global $wpdb;
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT h.host_uuid, h.name
+				FROM {$wpdb->prefix}hbc_host_assignments a
+				INNER JOIN {$wpdb->prefix}hbc_hosts h ON h.host_uuid = a.host_uuid
+				WHERE a.identity_uuid = %s AND a.role_key = 'host' AND a.revoked_at IS NULL
+				AND a.starts_at <= UTC_TIMESTAMP() AND (a.ends_at IS NULL OR a.ends_at >= UTC_TIMESTAMP())
+				ORDER BY a.starts_at DESC LIMIT 1",
+				$identity_uuid
+			)
+		);
+		return $row instanceof stdClass ? $row : null;
+	}
+
+	private static function ensure_host_assignment( string $host_uuid, string $identity_uuid ): bool {
+		global $wpdb;
+		if ( ! self::is_uuid( $host_uuid ) || ! self::is_uuid( $identity_uuid ) ) {
+			return false;
+		}
+		$table = $wpdb->prefix . 'hbc_host_assignments';
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT assignment_uuid FROM {$table}
+				WHERE host_uuid = %s AND identity_uuid = %s AND role_key = 'host' AND revoked_at IS NULL
+				LIMIT 1",
+				$host_uuid,
+				$identity_uuid
+			)
+		);
+		if ( is_string( $found ) && $found !== '' ) {
+			return true;
+		}
+		$saved = $wpdb->insert(
+			$table,
+			array(
+				'assignment_uuid' => self::uuid(),
+				'host_uuid'       => $host_uuid,
+				'identity_uuid'   => $identity_uuid,
+				'role_key'        => 'host',
+				'scope_type'      => 'organization',
+				'scope_uuid'      => $host_uuid,
+				'starts_at'       => self::now(),
+				'ends_at'         => null,
+				'revoked_at'      => null,
+			)
+		);
+		return false !== $saved;
+	}
+
+	/**
+	 * @param object $host
+	 * @return array<string, mixed>
+	 */
+	private static function organizer_payload( $host, bool $already ): array {
+		$code = class_exists( 'HBC_Prod_Orgs' ) ? HBC_Prod_Orgs::public_code_for_host( (string) $host->host_uuid ) : '';
+		return array(
+			'host_uuid'     => (string) $host->host_uuid,
+			'name'          => (string) $host->name,
+			'public_code'   => $code,
+			'dashboard_url' => self::organizer_dashboard_url(),
+			'already'       => $already,
+			'message'       => $already
+				? 'This phone is already the organizer.'
+				: 'This phone is saved as the organizer.',
+		);
+	}
+
+	public static function organizer_dashboard_url(): string {
+		return add_query_arg( 'organizer', '1', home_url( '/super-admin/' ) );
+	}
+
+	/**
+	 * Active host organizations keyed by identity. Used by the administrator user list.
+	 *
+	 * @return array<string, list<string>>
+	 */
+	public static function host_organizations_by_identity(): array {
+		static $cache = null;
+		if ( is_array( $cache ) ) {
+			return $cache;
+		}
+		global $wpdb;
+		$rows  = $wpdb->get_results(
+			"SELECT a.identity_uuid, h.name
+			FROM {$wpdb->prefix}hbc_host_assignments a
+			INNER JOIN {$wpdb->prefix}hbc_hosts h ON h.host_uuid = a.host_uuid
+			WHERE a.role_key = 'host' AND a.revoked_at IS NULL
+			AND a.starts_at <= UTC_TIMESTAMP() AND (a.ends_at IS NULL OR a.ends_at >= UTC_TIMESTAMP())
+			ORDER BY h.name ASC"
+		);
+		$cache = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$identity = (string) $row->identity_uuid;
+			if ( ! self::is_uuid( $identity ) ) {
+				continue;
+			}
+			$cache[ $identity ][] = (string) $row->name;
+		}
+		return $cache;
+	}
+
+	/**
+	 * WordPress accounts that are active hosts, for the administrator.
+	 *
+	 * @return list<array<string, mixed>>
+	 */
+	public static function list_wordpress_hosts(): array {
+		$orgs = self::host_organizations_by_identity();
+		$out  = array();
+		foreach ( $orgs as $identity => $names ) {
+			$users = get_users(
+				array(
+					'meta_key'   => 'hbc_identity_uuid',
+					'meta_value' => $identity,
+					'number'     => 20,
+				)
+			);
+			$organization = implode( ', ', $names );
+			if ( ! $users ) {
+				$out[] = array(
+					'user_id'      => 0,
+					'display_name' => 'Phone organizer',
+					'user_login'   => '',
+					'user_email'   => '',
+					'roles'        => '',
+					'organization' => $organization,
+					'edit_url'     => '',
+				);
+				continue;
+			}
+			$role_names = wp_roles()->role_names;
+			foreach ( $users as $user ) {
+				if ( ! $user instanceof WP_User ) {
+					continue;
+				}
+				$labels = array();
+				foreach ( (array) $user->roles as $role ) {
+					$labels[] = translate_user_role( (string) ( $role_names[ $role ] ?? $role ) );
+				}
+				$out[] = array(
+					'user_id'      => (int) $user->ID,
+					'display_name' => (string) $user->display_name,
+					'user_login'   => (string) $user->user_login,
+					'user_email'   => (string) $user->user_email,
+					'roles'        => implode( ', ', $labels ),
+					'organization' => $organization,
+					'edit_url'     => get_edit_user_link( $user->ID ),
+				);
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Profile for a phone that is an active host. Null for a guest RSVP.
+	 *
+	 * @return array<string, string>|null
+	 */
+	public static function organizer_profile( string $identity_uuid ): ?array {
+		$org = self::active_host_organization( $identity_uuid );
+		if ( ! $org ) {
+			return null;
+		}
+		$code = class_exists( 'HBC_Prod_Orgs' ) ? HBC_Prod_Orgs::public_code_for_host( (string) $org->host_uuid ) : '';
+		return array(
+			'name'          => (string) $org->name,
+			'public_code'   => $code,
+			'dashboard_url' => self::organizer_dashboard_url(),
+		);
+	}
+
+	/**
+	 * Participate requests for events on organizations this phone organizes.
+	 * Requests for any other host's events are omitted.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function organizer_dashboard( string $identity_uuid ): array {
+		$profile = self::organizer_profile( $identity_uuid );
+		if ( ! $profile ) {
+			return array(
+				'error' => array(
+					'code'    => 'not_host',
+					'message' => 'This phone is not an organizer.',
+				),
+			);
+		}
+		$profile['events'] = self::events_for_organizer( $identity_uuid );
+		return $profile;
+	}
+
+	/**
+	 * Publish an event on an organization this phone organizes.
+	 *
+	 * @param array<string, mixed> $payload
+	 * @return array<string, mixed>
+	 */
+	public static function create_organizer_event( string $identity_uuid, array $payload ): array {
+		$org = self::active_host_organization( $identity_uuid );
+		if ( ! $org ) {
+			return array(
+				'error' => array(
+					'code'    => 'not_host',
+					'message' => 'This phone is not an organizer.',
+				),
+			);
+		}
+		$hosts    = self::host_uuids_for_identity( $identity_uuid );
+		$requested = sanitize_text_field( (string) ( $payload['host_uuid'] ?? '' ) );
+		$host_uuid = ( $requested !== '' && in_array( $requested, $hosts, true ) ) ? $requested : (string) $org->host_uuid;
+		$result    = self::create_event(
+			$host_uuid,
+			array(
+				'name'              => (string) ( $payload['name'] ?? '' ),
+				'location'          => (string) ( $payload['location'] ?? '' ),
+				'description'       => (string) ( $payload['description'] ?? '' ),
+				'starts_at'         => (string) ( $payload['starts_at'] ?? '' ),
+				'ends_at'           => (string) ( $payload['ends_at'] ?? '' ),
+				'event_code'        => (string) ( $payload['event_code'] ?? '' ),
+				'event_type'        => 'community',
+				'status'            => 'published',
+				'allow_observe'     => true,
+				'allow_participate' => true,
+			)
+		);
+		if ( ! empty( $result['error'] ) ) {
+			return $result;
+		}
+		$result['encounter_url'] = add_query_arg( 'event', (string) $result['event_uuid'], home_url( '/r/' ) );
+		return $result;
+	}
+
+	/**
+	 * Accept or decline a Participate request only when the event belongs to this organizer.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function review_organizer_request( string $identity_uuid, string $volunteer_uuid, string $decision ): array {
+		if ( ! self::organizer_owns_request( $identity_uuid, $volunteer_uuid ) ) {
+			return array(
+				'error' => array(
+					'code'    => 'request_forbidden',
+					'message' => 'That request is not for an event you created.',
+				),
+			);
+		}
+		return self::review_volunteer( $volunteer_uuid, $decision, $identity_uuid );
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	private static function host_uuids_for_identity( string $identity_uuid ): array {
+		global $wpdb;
+		if ( ! self::is_uuid( $identity_uuid ) ) {
+			return array();
+		}
+		$rows = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT host_uuid FROM {$wpdb->prefix}hbc_host_assignments
+				WHERE identity_uuid = %s AND role_key = 'host' AND revoked_at IS NULL
+				AND starts_at <= UTC_TIMESTAMP() AND (ends_at IS NULL OR ends_at >= UTC_TIMESTAMP())",
+				$identity_uuid
+			)
+		);
+		$out = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $uuid ) {
+			if ( self::is_uuid( (string) $uuid ) ) {
+				$out[] = (string) $uuid;
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Events on organizations this phone organizes.
+	 *
+	 * @return list<array<string, string>>
+	 */
+	private static function events_for_organizer( string $identity_uuid ): array {
+		global $wpdb;
+		$hosts = self::host_uuids_for_identity( $identity_uuid );
+		if ( ! $hosts ) {
+			return array();
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
+		$sql          = "SELECT e.event_uuid, e.name, e.status, e.location, e.starts_at, e.ends_at, c.event_code
+			FROM {$wpdb->prefix}hbc_events e
+			LEFT JOIN {$wpdb->prefix}hbc_event_codes c ON c.event_uuid = e.event_uuid AND c.status = 'active'
+			WHERE e.host_uuid IN ({$placeholders}) AND e.status IN ('published', 'draft')
+			ORDER BY e.created_at DESC
+			LIMIT 50";
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$hosts ) );
+		$requests   = array();
+		$encounters = array();
+		$totals     = self::encounter_totals_for_organizer( $identity_uuid );
+		foreach ( self::requests_for_organizer( $identity_uuid ) as $request ) {
+			$requests[ (string) ( $request['event_uuid'] ?? '' ) ][] = $request;
+		}
+		foreach ( self::encounters_for_organizer( $identity_uuid ) as $encounter ) {
+			$encounters[ (string) ( $encounter['event_uuid'] ?? '' ) ][] = $encounter;
+		}
+		$out = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$uuid  = (string) $row->event_uuid;
+			$out[] = array(
+				'event_uuid'       => $uuid,
+				'name'             => (string) $row->name,
+				'status'           => (string) $row->status,
+				'location'         => (string) ( $row->location ?? '' ),
+				'starts_at'        => self::iso( (string) $row->starts_at ),
+				'ends_at'          => self::iso( (string) ( $row->ends_at ?? '' ) ),
+				'event_code'       => (string) ( $row->event_code ?? '' ),
+				'encounter_url'    => add_query_arg( 'event', $uuid, home_url( '/r/' ) ),
+				'requests'         => $requests[ $uuid ] ?? array(),
+				'encounter_total'  => (int) ( $totals[ $uuid ] ?? 0 ),
+				'encounters'       => $encounters[ $uuid ] ?? array(),
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * @return list<array<string, string>>
+	 */
+	private static function requests_for_organizer( string $identity_uuid ): array {
+		global $wpdb;
+		$hosts = self::host_uuids_for_identity( $identity_uuid );
+		if ( ! $hosts ) {
+			return array();
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
+		$sql          = "SELECT r.rsvp_uuid, r.event_uuid, r.identity_uuid, r.rsvp_choice, r.status, r.completed_at,
+				e.name AS event_name, v.volunteer_request_uuid, v.state AS volunteer_state
+			FROM {$wpdb->prefix}hbc_rsvps r
+			INNER JOIN {$wpdb->prefix}hbc_events e ON e.event_uuid = r.event_uuid
+			LEFT JOIN {$wpdb->prefix}hbc_volunteer_requests v ON v.rsvp_uuid = r.rsvp_uuid
+			WHERE e.host_uuid IN ({$placeholders})
+			ORDER BY r.completed_at DESC
+			LIMIT 200";
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$hosts ) );
+		$out  = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$out[] = array(
+				'rsvp_uuid'              => (string) $row->rsvp_uuid,
+				'volunteer_request_uuid' => (string) ( $row->volunteer_request_uuid ?? '' ),
+				'event_uuid'             => (string) $row->event_uuid,
+				'event_name'             => (string) $row->event_name,
+				'choice'                 => (string) $row->rsvp_choice,
+				'status'                 => (string) $row->status,
+				'state'                  => (string) ( $row->volunteer_state ?? '' ),
+				'identity'               => (string) $row->identity_uuid,
+				'created_at'             => self::iso( (string) $row->completed_at ),
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * Every attendance session for this organizer's events, including expired ones.
+	 *
+	 * @return array<string, int>
+	 */
+	private static function encounter_totals_for_organizer( string $identity_uuid ): array {
+		global $wpdb;
+		$hosts = self::host_uuids_for_identity( $identity_uuid );
+		if ( ! $hosts ) {
+			return array();
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
+		$sql          = "SELECT s.event_uuid, COUNT(*) AS total
+			FROM {$wpdb->prefix}hbc_attendance_sessions s
+			INNER JOIN {$wpdb->prefix}hbc_events e ON e.event_uuid = s.event_uuid
+			WHERE e.host_uuid IN ({$placeholders})
+			GROUP BY s.event_uuid";
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$hosts ) );
+		$out  = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$out[ (string) $row->event_uuid ] = (int) $row->total;
+		}
+		return $out;
+	}
+
+	/**
+	 * Encounters on this organizer's events. The scan code is not included.
+	 *
+	 * @return list<array<string, string>>
+	 */
+	private static function encounters_for_organizer( string $identity_uuid ): array {
+		global $wpdb;
+		$hosts = self::host_uuids_for_identity( $identity_uuid );
+		if ( ! $hosts ) {
+			return array();
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
+		$sql          = "SELECT s.session_uuid, s.event_uuid, s.encounter_type, s.state, s.issued_at, s.attendee_identity_uuid
+			FROM {$wpdb->prefix}hbc_attendance_sessions s
+			INNER JOIN {$wpdb->prefix}hbc_events e ON e.event_uuid = s.event_uuid
+			WHERE e.host_uuid IN ({$placeholders})
+			ORDER BY s.issued_at DESC
+			LIMIT 200";
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, ...$hosts ) );
+		$out  = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$attendee = (string) ( $row->attendee_identity_uuid ?? '' );
+			$out[]    = array(
+				'session_uuid'   => (string) $row->session_uuid,
+				'event_uuid'     => (string) $row->event_uuid,
+				'encounter_type' => (string) ( $row->encounter_type ?? '' ),
+				'state'          => (string) $row->state,
+				'issued_at'      => self::iso( (string) $row->issued_at ),
+				'attendee'       => self::is_uuid( $attendee ) ? $attendee : '',
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * Every RSVP and the encounter total for one event.
+	 *
+	 * @return array{requests: list<array<string, string>>, encounter_total: int, encounters: list<array<string, string>>}
+	 */
+	public static function activity_for_event( string $event_uuid ): array {
+		global $wpdb;
+		$empty = array(
+			'requests'         => array(),
+			'encounter_total'  => 0,
+			'encounters'       => array(),
+		);
+		if ( ! self::is_uuid( $event_uuid ) ) {
+			return $empty;
+		}
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT r.rsvp_uuid, r.event_uuid, r.identity_uuid, r.rsvp_choice, r.status, r.completed_at,
+					v.volunteer_request_uuid, v.state AS volunteer_state
+				FROM {$wpdb->prefix}hbc_rsvps r
+				LEFT JOIN {$wpdb->prefix}hbc_volunteer_requests v ON v.rsvp_uuid = r.rsvp_uuid
+				WHERE r.event_uuid = %s
+				ORDER BY r.completed_at DESC",
+				$event_uuid
+			)
+		);
+		$requests = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$requests[] = array(
+				'rsvp_uuid'              => (string) $row->rsvp_uuid,
+				'volunteer_request_uuid' => (string) ( $row->volunteer_request_uuid ?? '' ),
+				'event_uuid'             => (string) $row->event_uuid,
+				'choice'                 => (string) $row->rsvp_choice,
+				'status'                 => (string) $row->status,
+				'state'                  => (string) ( $row->volunteer_state ?? '' ),
+				'identity'               => (string) $row->identity_uuid,
+				'created_at'             => self::iso( (string) $row->completed_at ),
+			);
+		}
+		$encounters = array();
+		$sessions   = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT session_uuid, encounter_type, state, issued_at, attendee_identity_uuid
+				FROM {$wpdb->prefix}hbc_attendance_sessions
+				WHERE event_uuid = %s
+				ORDER BY issued_at DESC",
+				$event_uuid
+			)
+		);
+		foreach ( is_array( $sessions ) ? $sessions : array() as $row ) {
+			$attendee = (string) ( $row->attendee_identity_uuid ?? '' );
+			$encounters[] = array(
+				'session_uuid'   => (string) $row->session_uuid,
+				'encounter_type' => (string) ( $row->encounter_type ?? '' ),
+				'state'          => (string) $row->state,
+				'issued_at'      => self::iso( (string) $row->issued_at ),
+				'attendee'       => self::is_uuid( $attendee ) ? $attendee : '',
+			);
+		}
+		return array(
+			'requests'        => $requests,
+			'encounter_total' => count( $encounters ),
+			'encounters'      => $encounters,
+		);
+	}
+
+	private static function organizer_owns_request( string $identity_uuid, string $volunteer_uuid ): bool {
+		global $wpdb;
+		$hosts = self::host_uuids_for_identity( $identity_uuid );
+		if ( ! $hosts || ! self::is_uuid( $volunteer_uuid ) ) {
+			return false;
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
+		$args         = array_merge( array( $volunteer_uuid ), $hosts );
+		$found        = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT e.host_uuid
+				FROM {$wpdb->prefix}hbc_volunteer_requests v
+				INNER JOIN {$wpdb->prefix}hbc_rsvps r ON r.rsvp_uuid = v.rsvp_uuid
+				INNER JOIN {$wpdb->prefix}hbc_events e ON e.event_uuid = r.event_uuid
+				WHERE v.volunteer_request_uuid = %s AND e.host_uuid IN ({$placeholders})
+				LIMIT 1",
+				...$args
+			)
+		);
+		return is_string( $found ) && $found !== '';
 	}
 
 	public static function assignment( string $identity_uuid, string $event_uuid, string $assignment_uuid = '', string $role = '' ) {
@@ -1792,6 +2582,10 @@ final class HBC_Prod_Store {
 	 * @return array{code:string,message:string}|null
 	 */
 	public static function encounter_start_block( string $operator_identity, string $event_uuid ): ?array {
+		$assignment = self::assignment( $operator_identity, $event_uuid );
+		if ( is_array( $assignment ) && in_array( (string) $assignment['role'], array( 'host', 'greeter' ), true ) ) {
+			return null;
+		}
 		if ( ! self::identity_is_active_miner( $operator_identity ) ) {
 			return array(
 				'code'    => 'miner_required',
@@ -1877,11 +2671,21 @@ final class HBC_Prod_Store {
 			array(
 				'meta_key'   => 'hbc_identity_uuid',
 				'meta_value' => $identity_uuid,
-				'number'     => 1,
+				'number'     => 20,
 				'fields'     => 'ID',
 			)
 		);
-		return ! empty( $users[0] ) ? (int) $users[0] : 0;
+		$fallback = 0;
+		foreach ( $users as $id ) {
+			$id = (int) $id;
+			if ( $fallback === 0 ) {
+				$fallback = $id;
+			}
+			if ( user_can( $id, 'manage_options' ) || user_can( $id, 'hbc_super_admin' ) ) {
+				return $id;
+			}
+		}
+		return $fallback;
 	}
 
 	public static function save_rsvp( string $event_uuid, string $identity_uuid, string $response, array $practice = array() ) {

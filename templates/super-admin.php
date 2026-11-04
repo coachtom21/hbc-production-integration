@@ -1,6 +1,13 @@
 <?php
 defined( 'ABSPATH' ) || exit;
 
+$hbc_organizer_view = isset( $_GET['organizer'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+$hbc_is_super       = is_user_logged_in() && current_user_can( 'hbc_super_admin' );
+if ( ! $hbc_is_super || $hbc_organizer_view ) {
+	require __DIR__ . '/organizer-dashboard.php';
+	return;
+}
+
 if ( ! is_user_logged_in() || ! current_user_can( 'hbc_super_admin' ) ) {
 	status_header( 403 );
 	wp_die( esc_html__( 'Protected Super Admin access is required.', 'hbc-prod' ) );

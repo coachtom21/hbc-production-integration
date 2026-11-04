@@ -40,6 +40,32 @@ final class HBC_Production_Adapters {
 		add_action( 'hbc_discard_registration_session', array( __CLASS__, 'discard_session' ) );
 		add_action( 'pmpro_after_checkout', array( __CLASS__, 'after_paid_membership' ), 20, 2 );
 		add_action( 'wp_login', array( __CLASS__, 'stamp_privileged_auth' ), 10, 2 );
+		add_action( 'wp_enqueue_scripts', array( __CLASS__, 'bootstrap_admin_encounter_tab' ), 20 );
+	}
+
+	/**
+	 * Human Gold → Events → Start encounter opens /r in this tab as the event host.
+	 * The token stays in this tab and does not replace another phone saved in the browser.
+	 */
+	public static function bootstrap_admin_encounter_tab(): void {
+		if ( ! get_query_var( 'hbc_universal_entry' ) || (string) ( $_GET['console'] ?? '' ) !== '1' ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return;
+		}
+		$event_uuid = isset( $_GET['event'] ) ? sanitize_text_field( (string) wp_unslash( $_GET['event'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$nonce      = isset( $_GET['hbc_console'] ) ? sanitize_text_field( (string) wp_unslash( $_GET['hbc_console'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( ! is_user_logged_in() || ! wp_verify_nonce( $nonce, 'hbc_console_' . $event_uuid ) ) {
+			return;
+		}
+		nocache_headers();
+		$token = HBC_Prod_Store::console_encounter_token( $event_uuid, get_current_user_id() );
+		if ( $token === '' ) {
+			return;
+		}
+		wp_add_inline_script(
+			'hbc-laugh',
+			'try{sessionStorage.setItem("hbc_device_token_tab",' . wp_json_encode( $token ) . ');}catch(e){}',
+			'before'
+		);
 	}
 
 	public static function trade_unlocked_filter( $default = false ): bool {
@@ -108,6 +134,14 @@ final class HBC_Production_Adapters {
 				)
 				: null;
 		}
+		$token    = (string) ( $request['device_token'] ?? '' );
+		$identity = $token !== '' ? HBC_Prod_Store::resolve_token( $token ) : false;
+		if ( is_string( $identity ) && $identity !== '' ) {
+			$organizer = HBC_Prod_Store::organizer_profile( $identity );
+			if ( $organizer ) {
+				$page['organizer'] = $organizer;
+			}
+		}
 		return $page;
 	}
 
@@ -131,7 +165,7 @@ final class HBC_Production_Adapters {
 		$identity = $device_token ? HBC_Prod_Store::resolve_token( (string) $device_token ) : false;
 		$registered = (bool) $identity;
 		$assignment = $registered ? HBC_Prod_Store::assignment( (string) $identity, (string) $event_uuid ) : false;
-		$operator   = is_array( $assignment ) && HBC_Prod_Store::is_megavoter_identity( (string) $identity );
+		$operator   = is_array( $assignment ) && in_array( (string) ( $assignment['role'] ?? '' ), array( 'host', 'greeter' ), true );
 
 		$route_view = 'device_registration';
 		if ( $registered && $operator ) {
@@ -152,13 +186,19 @@ final class HBC_Production_Adapters {
 		if ( $host ) {
 			$out['organization'] = array( 'name' => $host->name );
 		}
+		if ( $registered ) {
+			$organizer = HBC_Prod_Store::organizer_profile( (string) $identity );
+			if ( $organizer ) {
+				$out['organizer'] = $organizer;
+			}
+		}
 		if ( $operator && is_array( $assignment ) ) {
 			$authorization = array(
 				'assignment_uuid' => $assignment['assignment_uuid'],
 				'role'            => $assignment['role'],
 			);
 			if ( $assignment['role'] === 'host' ) {
-				$authorization['dashboard_url'] = home_url( '/organize/' );
+				$authorization['dashboard_url'] = HBC_Prod_Store::organizer_dashboard_url();
 			}
 			$out['assignment_uuid']  = $assignment['assignment_uuid'];
 			$out['operator_role']    = $assignment['role'];
@@ -379,6 +419,15 @@ final class HBC_Production_Adapters {
 
 		$identity = HBC_Prod_Store::ensure_identity( $session['email'], $session['phone'], $user_id, true );
 		$token    = HBC_Prod_Store::issue_device_token( $identity['identity_uuid'] );
+		if ( $token === '' ) {
+			delete_transient( 'hbc_reg_' . $session_id );
+			return array(
+				'error' => array(
+					'code'    => 'device_save_failed',
+					'message' => 'The code was accepted, but this device could not be saved. Please request a new code.',
+				),
+			);
+		}
 		if ( $user_id && user_can( $user_id, 'manage_options' ) ) {
 			HBC_Prod_Store::bind_admin_host_if_needed( $identity['identity_uuid'] );
 		}

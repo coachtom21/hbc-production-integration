@@ -55,6 +55,8 @@ add_action(
 );
 add_action( 'init', array( 'HBC_Prod_Store', 'maybe_open_local_registration' ), 40 );
 add_action( 'admin_menu', array( 'HBC_Prod_Admin', 'menu' ) );
+add_filter( 'manage_users_columns', array( 'HBC_Prod_Admin', 'users_columns' ) );
+add_filter( 'manage_users_custom_column', array( 'HBC_Prod_Admin', 'users_column' ), 10, 3 );
 add_action( 'admin_init', array( 'HBC_Prod_Admin', 'maybe_handle_create_event' ) );
 add_action( 'hbc_prod_orphan_sweep', array( 'HBC_Prod_Store', 'sweep_orphans' ) );
 add_action( 'rest_api_init', array( 'HBC_Prod_Admin', 'register_rest' ) );

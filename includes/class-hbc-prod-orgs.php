@@ -151,8 +151,11 @@ final class HBC_Prod_Orgs {
 	}
 
 	private static function suggest_code( string $name ): string {
-		$base = strtoupper( preg_replace( '/[^A-Z0-9]/', '', $name ) );
-		$base = substr( $base !== '' ? $base : 'ORG', 0, 8 );
+		$base = preg_replace( '/[^A-Z0-9]/', '', strtoupper( $name ) );
+		$base = substr( is_string( $base ) && $base !== '' ? $base : 'ORG', 0, 8 );
+		if ( strlen( $base ) < 4 ) {
+			$base = str_pad( $base, 4, 'X' );
+		}
 		$code = $base;
 		$n    = 2;
 		while ( self::host_uuid_for_code( $code ) !== '' && $n < 99 ) {
