@@ -2306,7 +2306,7 @@ final class HBC_Prod_Store {
 		}
 		$placeholders = implode( ',', array_fill( 0, count( $hosts ), '%s' ) );
 		$sql          = "SELECT r.rsvp_uuid, r.event_uuid, r.identity_uuid, r.rsvp_choice, r.status, r.completed_at,
-				e.name AS event_name, v.volunteer_request_uuid, v.state AS volunteer_state
+				e.name AS event_name, v.volunteer_request_uuid, v.state AS volunteer_state, v.created_at AS volunteer_created_at
 			FROM {$wpdb->prefix}hbc_rsvps r
 			INNER JOIN {$wpdb->prefix}hbc_events e ON e.event_uuid = r.event_uuid
 			LEFT JOIN {$wpdb->prefix}hbc_volunteer_requests v ON v.rsvp_uuid = r.rsvp_uuid
@@ -2325,7 +2325,7 @@ final class HBC_Prod_Store {
 				'status'                 => (string) $row->status,
 				'state'                  => (string) ( $row->volunteer_state ?? '' ),
 				'identity'               => (string) $row->identity_uuid,
-				'created_at'             => self::iso( (string) $row->completed_at ),
+				'created_at'             => self::iso( (string) ( $row->volunteer_created_at ? $row->volunteer_created_at : $row->completed_at ) ),
 			);
 		}
 		return $out;
@@ -2391,7 +2391,8 @@ final class HBC_Prod_Store {
 	}
 
 	/**
-	 * Every RSVP and the encounter total for one event.
+	 * Participate (volunteer) requests and the encounter total for one event.
+	 * Observe RSVPs stay off this list.
 	 *
 	 * @return array{requests: list<array<string, string>>, encounter_total: int, encounters: list<array<string, string>>}
 	 */
@@ -2408,11 +2409,11 @@ final class HBC_Prod_Store {
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT r.rsvp_uuid, r.event_uuid, r.identity_uuid, r.rsvp_choice, r.status, r.completed_at,
-					v.volunteer_request_uuid, v.state AS volunteer_state
+					v.volunteer_request_uuid, v.state AS volunteer_state, v.created_at AS volunteer_created_at
 				FROM {$wpdb->prefix}hbc_rsvps r
-				LEFT JOIN {$wpdb->prefix}hbc_volunteer_requests v ON v.rsvp_uuid = r.rsvp_uuid
-				WHERE r.event_uuid = %s
-				ORDER BY r.completed_at DESC",
+				INNER JOIN {$wpdb->prefix}hbc_volunteer_requests v ON v.rsvp_uuid = r.rsvp_uuid
+				WHERE r.event_uuid = %s AND r.rsvp_choice = 'participate'
+				ORDER BY v.created_at DESC",
 				$event_uuid
 			)
 		);
@@ -2426,7 +2427,7 @@ final class HBC_Prod_Store {
 				'status'                 => (string) $row->status,
 				'state'                  => (string) ( $row->volunteer_state ?? '' ),
 				'identity'               => (string) $row->identity_uuid,
-				'created_at'             => self::iso( (string) $row->completed_at ),
+				'created_at'             => self::iso( (string) $row->volunteer_created_at ),
 			);
 		}
 		$encounters = array();

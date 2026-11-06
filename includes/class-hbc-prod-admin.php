@@ -725,9 +725,9 @@ final class HBC_Prod_Admin {
 	private static function render_event_activity( string $event_uuid ): void {
 		$activity = HBC_Prod_Store::activity_for_event( $event_uuid );
 		$requests = $activity['requests'];
-		echo '<h3>Requests (' . count( $requests ) . ')</h3>';
+		echo '<h3>Volunteer requests (' . count( $requests ) . ')</h3>';
 		if ( ! $requests ) {
-			echo '<p>No requests for this event.</p>';
+			echo '<p>No volunteer requests for this event.</p>';
 		} else {
 			echo '<table class="widefat striped"><thead><tr><th>Request</th><th>State</th><th>When</th><th>Actions</th></tr></thead><tbody>';
 			foreach ( $requests as $v ) {

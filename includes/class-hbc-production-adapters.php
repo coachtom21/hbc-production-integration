@@ -400,6 +400,13 @@ final class HBC_Production_Adapters {
 		if ( $user_id && function_exists( 'hb_grant_free_yamer_membership' ) ) {
 			hb_grant_free_yamer_membership( $user_id );
 		}
+		if ( $user_id && class_exists( 'Cpm_Humanblockchain_Device_Registry' ) ) {
+			Cpm_Humanblockchain_Device_Registry::register_phone_for_user(
+				$user_id,
+				(string) $session['phone'],
+				(string) $session['email']
+			);
+		}
 		if ( $user_id ) {
 			$display_name = sanitize_text_field( (string) ( $session['display_name'] ?? '' ) );
 			if ( $display_name !== '' ) {
