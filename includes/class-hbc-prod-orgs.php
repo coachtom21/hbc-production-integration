@@ -7,7 +7,7 @@ defined( 'ABSPATH' ) || exit;
  */
 final class HBC_Prod_Orgs {
 	public const ORG_CODES_OPTION     = 'hbc_org_public_codes';
-	public const SUPER_ADMIN_MAX      = 2;
+	public const SUPER_ADMIN_MAX      = 1;
 	public const SUPER_ADMIN_ALLOWLIST = 'hbc_super_admin_user_ids';
 	public const RECONCILE_OPTION     = 'hbc_reconcile_snapshots';
 
@@ -15,7 +15,74 @@ final class HBC_Prod_Orgs {
 		add_action( 'user_register', array( __CLASS__, 'guard_super_admin_cap' ), 20 );
 		add_action( 'profile_update', array( __CLASS__, 'guard_super_admin_cap' ), 20 );
 		add_action( 'set_user_role', array( __CLASS__, 'on_set_role' ), 20, 3 );
+		add_action( 'delete_user', array( __CLASS__, 'delete_user_organizations' ) );
 		add_filter( 'hbc_list_public_events', array( __CLASS__, 'filter_public_events_by_org' ), 5, 2 );
+	}
+
+	/**
+	 * Remove every organization this user hosts. Their public code and events go with it.
+	 */
+	public static function delete_user_organizations( int $user_id ): void {
+		$identity = (string) get_user_meta( $user_id, 'hbc_identity_uuid', true );
+		if ( class_exists( 'HBC_Prod_Store' ) && HBC_Prod_Store::is_uuid( $identity ) ) {
+			global $wpdb;
+			$host_uuids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT host_uuid FROM {$wpdb->prefix}hbc_host_assignments WHERE identity_uuid = %s AND role_key = 'host'",
+					$identity
+				)
+			);
+			foreach ( is_array( $host_uuids ) ? $host_uuids : array() as $host_uuid ) {
+				self::delete_organization( (string) $host_uuid );
+			}
+			$wpdb->delete(
+				$wpdb->prefix . 'hbc_host_assignments',
+				array( 'identity_uuid' => $identity )
+			);
+		}
+		$allowed = self::allowed_super_admin_ids();
+		if ( in_array( $user_id, $allowed, true ) ) {
+			update_option( self::SUPER_ADMIN_ALLOWLIST, array(), false );
+		}
+	}
+
+	public static function delete_organization( string $host_uuid ): void {
+		if ( ! class_exists( 'HBC_Prod_Store' ) || ! HBC_Prod_Store::is_uuid( $host_uuid ) ) {
+			return;
+		}
+		global $wpdb;
+		$prefix = $wpdb->prefix;
+		if ( self::table_exists( $prefix . 'hbc_events' ) && self::table_exists( $prefix . 'hbc_event_codes' ) ) {
+			$event_ids = $wpdb->get_col( $wpdb->prepare( "SELECT event_uuid FROM {$prefix}hbc_events WHERE host_uuid = %s", $host_uuid ) );
+			if ( is_array( $event_ids ) && $event_ids ) {
+				$placeholders = implode( ',', array_fill( 0, count( $event_ids ), '%s' ) );
+				$wpdb->query( $wpdb->prepare( "DELETE FROM {$prefix}hbc_event_codes WHERE event_uuid IN ({$placeholders})", ...$event_ids ) );
+			}
+		}
+		foreach ( array( 'hbc_rsvps', 'hbc_volunteer_requests', 'hbc_attendance_sessions', 'hbc_access_requests', 'hbc_events', 'hbc_host_assignments', 'hbc_hosts' ) as $table ) {
+			self::delete_rows_for_host( $prefix . $table, $host_uuid );
+		}
+		$code = self::public_code_for_host( $host_uuid );
+		if ( $code !== '' ) {
+			self::release_code( $code, $host_uuid );
+		}
+	}
+
+	private static function table_exists( string $table ): bool {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table;
+	}
+
+	private static function delete_rows_for_host( string $table, string $host_uuid ): void {
+		global $wpdb;
+		if ( ! self::table_exists( $table ) ) {
+			return;
+		}
+		$columns = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
+		if ( ! is_array( $columns ) || ! in_array( 'host_uuid', $columns, true ) ) {
+			return;
+		}
+		$wpdb->delete( $table, array( 'host_uuid' => $host_uuid ) );
 	}
 
 	/**
@@ -36,9 +103,21 @@ final class HBC_Prod_Orgs {
 	}
 
 	public static function host_uuid_for_code( string $code ): string {
-		$code = strtoupper( preg_replace( '/[^A-Z0-9-]/', '', $code ) );
-		$map  = self::code_map();
-		return isset( $map[ $code ] ) ? (string) $map[ $code ] : '';
+		$code = self::normalize_code( $code );
+		if ( $code === '' ) {
+			return '';
+		}
+		foreach ( self::code_map() as $existing => $uuid ) {
+			if ( self::normalize_code( (string) $existing ) === $code && (string) $uuid !== '' ) {
+				return (string) $uuid;
+			}
+		}
+		return '';
+	}
+
+	public static function normalize_code( string $code ): string {
+		$clean = preg_replace( '/[^A-Z0-9-]/', '', strtoupper( $code ) );
+		return is_string( $clean ) ? $clean : '';
 	}
 
 	/**
@@ -50,7 +129,7 @@ final class HBC_Prod_Orgs {
 	public static function register_organization( array $payload, int $actor_user_id = 0 ): array {
 		$name = sanitize_text_field( (string) ( $payload['name'] ?? '' ) );
 		$type = sanitize_key( (string) ( $payload['type'] ?? 'church' ) );
-		$code = strtoupper( preg_replace( '/[^A-Z0-9-]/', '', (string) ( $payload['public_code'] ?? '' ) ) );
+		$supplied = self::normalize_code( (string) ( $payload['public_code'] ?? '' ) );
 		if ( $name === '' || strlen( $name ) > 180 ) {
 			return array(
 				'error' => array(
@@ -59,24 +138,34 @@ final class HBC_Prod_Orgs {
 				),
 			);
 		}
-		if ( $code === '' ) {
+		if ( $supplied === '' ) {
 			$code = self::suggest_code( $name );
-		}
-		if ( strlen( $code ) < 4 || strlen( $code ) > 16 ) {
-			return array(
-				'error' => array(
-					'code'    => 'validation_error',
-					'message' => 'Public organization code must be 4–16 letters/numbers.',
-				),
-			);
-		}
-		if ( self::host_uuid_for_code( $code ) !== '' ) {
-			return array(
-				'error' => array(
-					'code'    => 'duplicate_public_code',
-					'message' => 'That public organization code is already in use. Choose another.',
-				),
-			);
+			if ( $code === '' ) {
+				return array(
+					'error' => array(
+						'code'    => 'duplicate_public_code',
+						'message' => 'A unique public code could not be chosen. Enter one that no other organization uses.',
+					),
+				);
+			}
+		} else {
+			$code = $supplied;
+			if ( strlen( $code ) < 4 || strlen( $code ) > 16 ) {
+				return array(
+					'error' => array(
+						'code'    => 'validation_error',
+						'message' => 'Public organization code must be 4–16 letters/numbers.',
+					),
+				);
+			}
+			if ( self::host_uuid_for_code( $code ) !== '' ) {
+				return array(
+					'error' => array(
+						'code'    => 'duplicate_public_code',
+						'message' => 'That public code is already used by another organization. Choose a different code.',
+					),
+				);
+			}
 		}
 
 		$creator = '00000000-0000-4000-8000-000000000001';
@@ -89,6 +178,14 @@ final class HBC_Prod_Orgs {
 
 		$host_uuid = HBC_Prod_Store::uuid();
 		$now       = gmdate( 'Y-m-d H:i:s' );
+		if ( ! self::claim_code( $code, $host_uuid ) ) {
+			return array(
+				'error' => array(
+					'code'    => 'duplicate_public_code',
+					'message' => 'That public code is already used by another organization. Choose a different code.',
+				),
+			);
+		}
 		global $wpdb;
 		$ok = $wpdb->insert(
 			$wpdb->prefix . 'hbc_hosts',
@@ -103,6 +200,7 @@ final class HBC_Prod_Orgs {
 			)
 		);
 		if ( ! $ok ) {
+			self::release_code( $code, $host_uuid );
 			return array(
 				'error' => array(
 					'code'    => 'create_failed',
@@ -110,10 +208,6 @@ final class HBC_Prod_Orgs {
 				),
 			);
 		}
-
-		$map          = self::code_map();
-		$map[ $code ] = $host_uuid;
-		update_option( self::ORG_CODES_OPTION, $map, false );
 
 		// Assign creator as host for this org when they have an identity.
 		if ( HBC_Prod_Store::is_uuid( $creator ) && $creator !== '00000000-0000-4000-8000-000000000001' ) {
@@ -133,11 +227,11 @@ final class HBC_Prod_Orgs {
 			);
 		}
 
-		// Grant WP admin access hint for actor.
-		if ( $actor_user_id > 0 && user_can( $actor_user_id, 'read' ) ) {
+		// The person who registers the organization is its Host.
+		if ( $actor_user_id > 0 ) {
 			$user = new WP_User( $actor_user_id );
-			if ( ! $user->has_cap( 'hbc_admin' ) ) {
-				$user->add_cap( 'hbc_admin' );
+			if ( $user->exists() ) {
+				$user->add_role( 'hbc_host' );
 			}
 		}
 
@@ -156,13 +250,63 @@ final class HBC_Prod_Orgs {
 		if ( strlen( $base ) < 4 ) {
 			$base = str_pad( $base, 4, 'X' );
 		}
-		$code = $base;
-		$n    = 2;
-		while ( self::host_uuid_for_code( $code ) !== '' && $n < 99 ) {
-			$code = substr( $base, 0, 6 ) . $n;
-			$n++;
+		if ( self::host_uuid_for_code( $base ) === '' ) {
+			return $base;
 		}
-		return $code;
+		for ( $n = 2; $n < 100; $n++ ) {
+			$code = substr( $base, 0, 6 ) . $n;
+			if ( self::host_uuid_for_code( $code ) === '' ) {
+				return $code;
+			}
+		}
+		for ( $n = 0; $n < 20; $n++ ) {
+			$code = self::normalize_code( substr( $base, 0, 6 ) . wp_generate_password( 4, false, false ) );
+			if ( strlen( $code ) >= 4 && strlen( $code ) <= 16 && self::host_uuid_for_code( $code ) === '' ) {
+				return $code;
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Reserve a public code for this organization before the row is saved.
+	 * A code already used by another organization is left untouched.
+	 */
+	private static function claim_code( string $code, string $host_uuid ): bool {
+		$code = self::normalize_code( $code );
+		if ( $code === '' || $host_uuid === '' ) {
+			return false;
+		}
+		$map = array();
+		foreach ( self::code_map() as $existing => $uuid ) {
+			$key = self::normalize_code( (string) $existing );
+			$uuid = (string) $uuid;
+			if ( $key === '' || $uuid === '' || isset( $map[ $key ] ) ) {
+				continue;
+			}
+			if ( $key === $code ) {
+				return false;
+			}
+			$map[ $key ] = $uuid;
+		}
+		$map[ $code ] = $host_uuid;
+		update_option( self::ORG_CODES_OPTION, $map, false );
+		$saved = self::host_uuid_for_code( $code );
+		return $saved === $host_uuid;
+	}
+
+	private static function release_code( string $code, string $host_uuid ): void {
+		$code = self::normalize_code( $code );
+		if ( $code === '' || self::host_uuid_for_code( $code ) !== $host_uuid ) {
+			return;
+		}
+		$map = self::code_map();
+		foreach ( array_keys( $map ) as $existing ) {
+			if ( self::normalize_code( (string) $existing ) === $code ) {
+				unset( $map[ $existing ] );
+			}
+		}
+		update_option( self::ORG_CODES_OPTION, $map, false );
 	}
 
 	/**
@@ -218,82 +362,198 @@ final class HBC_Prod_Orgs {
 
 	public static function allowed_super_admin_ids(): array {
 		$ids = get_option( self::SUPER_ADMIN_ALLOWLIST, array() );
-		if ( ! is_array( $ids ) || ! $ids ) {
-			// Default: first two users who already have the cap, else empty (Super Admin must set).
-			$users = get_users(
-				array(
-					'capability' => 'hbc_super_admin',
-					'fields'     => 'ID',
-					'number'     => self::SUPER_ADMIN_MAX,
-				)
-			);
-			$ids = array_map( 'intval', $users );
-			if ( $ids ) {
-				update_option( self::SUPER_ADMIN_ALLOWLIST, $ids, false );
-			}
+		if ( ! is_array( $ids ) ) {
+			return array();
 		}
-		return array_values( array_unique( array_map( 'intval', is_array( $ids ) ? $ids : array() ) ) );
+		$ids = array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
+		return array_slice( $ids, 0, self::SUPER_ADMIN_MAX );
 	}
 
-	public static function set_super_admin_allowlist( array $user_ids ): array {
-		$user_ids = array_values( array_unique( array_map( 'intval', $user_ids ) ) );
-		$user_ids = array_filter( $user_ids );
-		if ( count( $user_ids ) > self::SUPER_ADMIN_MAX ) {
+	public static function designated_super_admin_id(): int {
+		$users = get_users(
+			array(
+				'role'   => 'hbc_super_admin',
+				'fields' => 'ID',
+				'number' => 1,
+				'orderby'=> 'ID',
+				'order'  => 'ASC',
+			)
+		);
+		return $users ? (int) $users[0] : 0;
+	}
+
+	/**
+	 * A WordPress Administrator appoints one user as Super Admin.
+	 * That person keeps Host or Subscriber. The previous Super Admin loses only that role.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function appoint_super_admin( int $user_id ): array {
+		$user = get_userdata( $user_id );
+		if ( ! ( $user instanceof WP_User ) ) {
 			return array(
 				'error' => array(
-					'code'    => 'super_admin_limit',
-					'message' => 'Only ' . self::SUPER_ADMIN_MAX . ' Super Admin accounts are allowed (Coach Tom + implementer).',
+					'code'    => 'validation_error',
+					'message' => 'Choose a user to make Super Admin.',
 				),
 			);
 		}
-		update_option( self::SUPER_ADMIN_ALLOWLIST, $user_ids, false );
-		// Sync caps.
-		$all = get_users( array( 'fields' => 'ID', 'number' => 500 ) );
-		foreach ( $all as $uid ) {
-			$user = new WP_User( (int) $uid );
-			if ( in_array( (int) $uid, $user_ids, true ) ) {
-				$user->add_cap( 'hbc_super_admin' );
-			} elseif ( user_can( $user, 'manage_options' ) ) {
-				// Keep WP Administrators able to open /super-admin for ops.
-				$user->add_cap( 'hbc_super_admin' );
-			} elseif ( $user->has_cap( 'hbc_super_admin' ) ) {
-				$user->remove_cap( 'hbc_super_admin' );
-			}
-		}
-		foreach ( $user_ids as $uid ) {
-			$user = new WP_User( $uid );
-			$user->add_cap( 'hbc_super_admin' );
-		}
-		return array(
-			'user_ids' => $user_ids,
-			'message'  => 'Super Admin allowlist updated (max ' . self::SUPER_ADMIN_MAX . ').',
+		$others = get_users(
+			array(
+				'role'    => 'hbc_super_admin',
+				'fields'  => 'ID',
+				'number'  => 50,
+				'exclude' => array( $user_id ),
+			)
 		);
+		foreach ( $others as $id ) {
+			$old = new WP_User( (int) $id );
+			$old->remove_role( 'hbc_super_admin' );
+		}
+		$chosen = new WP_User( $user_id );
+		$chosen->add_role( 'hbc_super_admin' );
+		update_option( self::SUPER_ADMIN_ALLOWLIST, array( $user_id ), false );
+		$name = $chosen->display_name !== '' ? $chosen->display_name : $chosen->user_login;
+		return array(
+			'user_id' => $user_id,
+			'message' => $name . ' is the Super Admin.',
+		);
+	}
+
+	public static function set_super_admin_allowlist( array $user_ids ): array {
+		$user_ids = array_values( array_unique( array_filter( array_map( 'intval', $user_ids ) ) ) );
+		if ( count( $user_ids ) !== 1 ) {
+			return array(
+				'error' => array(
+					'code'    => 'super_admin_limit',
+					'message' => 'Choose one user to be Super Admin.',
+				),
+			);
+		}
+		return self::appoint_super_admin( (int) $user_ids[0] );
 	}
 
 	public static function guard_super_admin_cap( int $user_id ): void {
 		$user = new WP_User( $user_id );
-		if ( ! $user->has_cap( 'hbc_super_admin' ) ) {
+		if ( ! in_array( 'hbc_super_admin', (array) $user->roles, true ) ) {
 			return;
 		}
-		// Never strip Administrators / manage_options — they are platform owners.
-		if ( user_can( $user, 'manage_options' ) ) {
+		if ( self::designated_super_admin_id() === $user_id && in_array( $user_id, self::allowed_super_admin_ids(), true ) ) {
 			return;
 		}
-		$allowed = self::allowed_super_admin_ids();
-		if ( in_array( $user_id, $allowed, true ) ) {
-			return;
-		}
-		if ( count( $allowed ) < self::SUPER_ADMIN_MAX ) {
-			$allowed[] = $user_id;
-			update_option( self::SUPER_ADMIN_ALLOWLIST, $allowed, false );
-			return;
-		}
-		$user->remove_cap( 'hbc_super_admin' );
+		self::appoint_super_admin( $user_id );
 	}
 
 	public static function on_set_role( int $user_id, string $role, array $old ): void {
 		unset( $role, $old );
 		self::guard_super_admin_cap( $user_id );
+	}
+
+	/**
+	 * Roles are Super Admin, WordPress Administrator, and Host.
+	 * Host is the person who has an organization registered.
+	 */
+	public static function ensure_roles(): void {
+		$roles   = wp_roles();
+		$changed = false;
+		if ( ! $roles->is_role( 'hbc_super_admin' ) ) {
+			add_role(
+				'hbc_super_admin',
+				'Super Admin',
+				array(
+					'read'            => true,
+					'hbc_super_admin' => true,
+				)
+			);
+			$roles = wp_roles();
+		} elseif ( ( $roles->role_names['hbc_super_admin'] ?? '' ) !== 'Super Admin' ) {
+			$roles->roles['hbc_super_admin']['name'] = 'Super Admin';
+			$roles->role_names['hbc_super_admin']    = 'Super Admin';
+			$changed                                 = true;
+		}
+		if ( ! $roles->is_role( 'hbc_host' ) ) {
+			add_role(
+				'hbc_host',
+				'Host',
+				array(
+					'read'      => true,
+					'hbc_admin' => true,
+				)
+			);
+			$roles = wp_roles();
+		} elseif ( ( $roles->role_names['hbc_host'] ?? '' ) !== 'Host' ) {
+			$roles->roles['hbc_host']['name'] = 'Host';
+			$roles->role_names['hbc_host']    = 'Host';
+			$changed                          = true;
+		}
+		if ( $changed ) {
+			update_option( $roles->role_key, $roles->roles );
+		}
+		if ( get_option( 'hbc_roles_simplified' ) === '1' ) {
+			if ( $roles->is_role( 'hbc_admin' ) ) {
+				remove_role( 'hbc_admin' );
+			}
+			return;
+		}
+		global $wpdb;
+		$table = $wpdb->prefix . 'hbc_host_assignments';
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+			return;
+		}
+		self::simplify_user_roles();
+		remove_role( 'hbc_admin' );
+		update_option( 'hbc_roles_simplified', '1', false );
+	}
+
+	private static function simplify_user_roles(): void {
+		foreach ( array_keys( HBC_Prod_Store::host_organizations_by_identity() ) as $identity ) {
+			$ids = get_users(
+				array(
+					'meta_key'   => 'hbc_identity_uuid',
+					'meta_value' => $identity,
+					'fields'     => 'ID',
+					'number'     => 20,
+				)
+			);
+			foreach ( $ids as $id ) {
+				$user = new WP_User( (int) $id );
+				if ( $user->exists() ) {
+					$user->add_role( 'hbc_host' );
+				}
+			}
+		}
+		$former = get_users(
+			array(
+				'role'   => 'hbc_admin',
+				'fields' => 'ID',
+				'number' => 500,
+			)
+		);
+		foreach ( $former as $id ) {
+			$user = new WP_User( (int) $id );
+			$user->remove_role( 'hbc_admin' );
+			if ( ! $user->roles ) {
+				$user->set_role( 'subscriber' );
+			}
+		}
+		$with_cap = get_users(
+			array(
+				'capability' => 'hbc_admin',
+				'fields'     => 'ID',
+				'number'     => 500,
+			)
+		);
+		foreach ( $with_cap as $id ) {
+			$user = new WP_User( (int) $id );
+			if ( user_can( $user, 'manage_options' ) || in_array( 'hbc_host', (array) $user->roles, true ) ) {
+				continue;
+			}
+			$user->remove_cap( 'hbc_admin' );
+			$user->remove_role( 'hbc_admin' );
+			if ( ! $user->roles ) {
+				$user->set_role( 'subscriber' );
+			}
+		}
 	}
 
 	/**

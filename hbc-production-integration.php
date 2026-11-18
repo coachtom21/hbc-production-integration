@@ -40,6 +40,7 @@ register_activation_hook(
 add_action( 'plugins_loaded', array( 'HBC_Production_Adapters', 'register' ), 20 );
 add_action( 'plugins_loaded', array( 'HBC_Prod_Orgs', 'register' ), 21 );
 add_action( 'init', array( 'HBC_Prod_Store', 'ensure_admin_caps' ), 5 );
+add_action( 'init', array( 'HBC_Prod_Orgs', 'ensure_roles' ), 35 );
 add_action( 'init', array( 'HBC_Prod_Store', 'maybe_seed' ), 30 );
 add_action( 'init', array( 'HBC_Prod_Orgs', 'ensure_seed_code' ), 32 );
 add_action( 'init', array( 'HBC_Prod_Admin', 'register_routes' ), 31 );

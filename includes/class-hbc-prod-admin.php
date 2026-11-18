@@ -115,8 +115,18 @@ final class HBC_Prod_Admin {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			return $columns;
 		}
-		$columns['hbc_host'] = 'Host';
-		return $columns;
+		$with_phone = array();
+		foreach ( $columns as $key => $label ) {
+			$with_phone[ $key ] = $label;
+			if ( $key === 'email' ) {
+				$with_phone['hbc_phone'] = 'Phone';
+			}
+		}
+		if ( ! isset( $with_phone['hbc_phone'] ) ) {
+			$with_phone['hbc_phone'] = 'Phone';
+		}
+		$with_phone['hbc_host'] = 'Host';
+		return $with_phone;
 	}
 
 	/**
@@ -125,7 +135,14 @@ final class HBC_Prod_Admin {
 	 * @param int    $user_id
 	 */
 	public static function users_column( $output, $column, $user_id ): string {
-		if ( $column !== 'hbc_host' || ! current_user_can( 'manage_options' ) ) {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return (string) $output;
+		}
+		if ( $column === 'hbc_phone' ) {
+			$phone = self::user_phone( (int) $user_id );
+			return $phone !== '' ? esc_html( $phone ) : '—';
+		}
+		if ( $column !== 'hbc_host' ) {
 			return (string) $output;
 		}
 		$identity = (string) get_user_meta( (int) $user_id, 'hbc_identity_uuid', true );
@@ -134,6 +151,31 @@ final class HBC_Prod_Admin {
 			return '—';
 		}
 		return 'Host — ' . implode( ', ', $orgs );
+	}
+
+	private static function user_phone( int $user_id ): string {
+		if ( class_exists( 'Cpm_Humanblockchain_Device_Registry' ) ) {
+			$saved = Cpm_Humanblockchain_Device_Registry::get_phone_for_user( $user_id );
+			$saved = is_string( $saved ) ? trim( $saved ) : '';
+			if ( $saved !== '' ) {
+				return $saved;
+			}
+		}
+		$identity = (string) get_user_meta( $user_id, 'hbc_identity_uuid', true );
+		if ( $identity === '' || ! class_exists( 'HBC_Prod_Store' ) ) {
+			return '';
+		}
+		global $wpdb;
+		$sealed = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT phone_ciphertext FROM {$wpdb->prefix}hbc_identities WHERE identity_uuid = %s",
+				$identity
+			)
+		);
+		if ( ! is_string( $sealed ) || $sealed === '' ) {
+			return '';
+		}
+		return trim( (string) HBC_Prod_Store::unseal( $sealed ) );
 	}
 
 	public static function menu(): void {
@@ -212,30 +254,33 @@ final class HBC_Prod_Admin {
 			self::handle_update_event_post();
 			return;
 		}
-		if ( $action === 'review_volunteer' ) {
-			self::handle_review_volunteer_post();
+		if ( $action === 'delete_event' ) {
+			self::handle_delete_event_post();
 			return;
 		}
-		if ( $action === 'trade_gate' && current_user_can( 'hbc_super_admin' ) ) {
-			self::handle_trade_gate_post();
+		if ( $action === 'review_volunteer' ) {
+			self::handle_review_volunteer_post();
 			return;
 		}
 		if ( $action === 'register_org' ) {
 			self::handle_register_org_post();
 			return;
 		}
-		if ( $action === 'reset_device' ) {
-			self::handle_reset_device_post();
+		if ( $action === 'delete_org' ) {
+			self::handle_delete_org_post();
 			return;
 		}
-		if ( $action === 'super_admin_allowlist' && current_user_can( 'hbc_super_admin' ) ) {
-			self::handle_super_admin_allowlist_post();
+		if ( $action === 'reset_device' ) {
+			self::handle_reset_device_post();
 			return;
 		}
 		if ( $action === 'reconcile_snapshot' && current_user_can( 'hbc_admin' ) ) {
 			check_admin_referer( 'hbc_reconcile_snapshot' );
 			$snap = HBC_Prod_Orgs::reconcile_snapshot();
 			self::redirect_ops( 'Reconciliation snapshot saved for ' . (string) ( $snap['period'] ?? '' ) . '.' );
+		}
+		if ( $action === 'appoint_super_admin' && current_user_can( 'manage_options' ) ) {
+			self::handle_appoint_super_admin_post();
 		}
 	}
 
@@ -258,6 +303,67 @@ final class HBC_Prod_Admin {
 		self::redirect_ops( (string) ( $result['message'] ?? 'Organization registered.' ) );
 	}
 
+	private static function handle_delete_org_post(): void {
+		$host_uuid = sanitize_text_field( (string) ( $_POST['host_uuid'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		check_admin_referer( 'hbc_delete_org_' . $host_uuid );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			self::redirect_ops( '', 'An Administrator deletes an organization.' );
+		}
+		if ( ! class_exists( 'HBC_Prod_Store' ) || ! HBC_Prod_Store::is_uuid( $host_uuid ) ) {
+			self::redirect_ops( '', 'That organization could not be deleted.' );
+		}
+		global $wpdb;
+		$name = (string) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT name FROM {$wpdb->prefix}hbc_hosts WHERE host_uuid = %s",
+				$host_uuid
+			)
+		);
+		if ( $name === '' ) {
+			self::redirect_ops( '', 'That organization could not be deleted.' );
+		}
+		$identities = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT identity_uuid FROM {$wpdb->prefix}hbc_host_assignments WHERE host_uuid = %s AND role_key = 'host'",
+				$host_uuid
+			)
+		);
+		HBC_Prod_Orgs::delete_organization( $host_uuid );
+		foreach ( is_array( $identities ) ? $identities : array() as $identity ) {
+			self::drop_host_role_if_unused( (string) $identity );
+		}
+		self::redirect_ops( $name . ' was deleted. The host account remains.' );
+	}
+
+	private static function drop_host_role_if_unused( string $identity ): void {
+		if ( ! class_exists( 'HBC_Prod_Store' ) || ! HBC_Prod_Store::is_uuid( $identity ) ) {
+			return;
+		}
+		global $wpdb;
+		$still = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->prefix}hbc_host_assignments WHERE identity_uuid = %s AND role_key = 'host'",
+				$identity
+			)
+		);
+		if ( $still > 0 ) {
+			return;
+		}
+		$users = get_users(
+			array(
+				'meta_key'   => 'hbc_identity_uuid',
+				'meta_value' => $identity,
+				'fields'     => 'ID',
+			)
+		);
+		foreach ( $users as $user_id ) {
+			$user = get_userdata( (int) $user_id );
+			if ( $user instanceof WP_User ) {
+				$user->remove_role( 'hbc_host' );
+			}
+		}
+	}
+
 	private static function handle_reset_device_post(): void {
 		$uuid = sanitize_text_field( (string) ( $_POST['device_uuid'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
 		check_admin_referer( 'hbc_reset_device_' . $uuid );
@@ -267,15 +373,17 @@ final class HBC_Prod_Admin {
 		self::redirect_ops( 'Device reset. That browser must register again on /r.' );
 	}
 
-	private static function handle_super_admin_allowlist_post(): void {
-		check_admin_referer( 'hbc_super_admin_allowlist' );
-		$raw = sanitize_text_field( (string) ( $_POST['user_ids'] ?? '' ) );
-		$ids = array_filter( array_map( 'intval', preg_split( '/[\s,]+/', $raw ) ?: array() ) );
-		$result = HBC_Prod_Orgs::set_super_admin_allowlist( $ids );
+	private static function handle_appoint_super_admin_post(): void {
+		check_admin_referer( 'hbc_appoint_super_admin' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			self::redirect_ops( '', 'An Administrator chooses the Super Admin.' );
+		}
+		$user_id = isset( $_POST['user_id'] ) ? (int) $_POST['user_id'] : 0;
+		$result  = HBC_Prod_Orgs::appoint_super_admin( $user_id );
 		if ( ! empty( $result['error']['message'] ) ) {
 			self::redirect_ops( '', (string) $result['error']['message'] );
 		}
-		self::redirect_ops( (string) ( $result['message'] ?? 'Allowlist updated.' ) );
+		self::redirect_ops( (string) ( $result['message'] ?? 'Super Admin saved.' ) );
 	}
 
 	private static function redirect_ops( string $ok = '', string $err = '' ): void {
@@ -310,12 +418,6 @@ final class HBC_Prod_Admin {
 			'records'       => 'Records',
 			'status'        => 'Status',
 		);
-		if ( current_user_can( 'manage_options' ) ) {
-			$tabs['hosts'] = 'Hosts';
-		}
-		if ( current_user_can( 'hbc_super_admin' ) ) {
-			$tabs['settings'] = 'Settings';
-		}
 		return $tabs;
 	}
 
@@ -346,10 +448,7 @@ final class HBC_Prod_Admin {
 		check_admin_referer( 'hbc_create_event' );
 
 		$host_uuid = sanitize_text_field( (string) ( $_POST['host_uuid'] ?? '' ) );
-		if ( ! HBC_Prod_Store::is_uuid( $host_uuid ) ) {
-			$host_uuid = HBC_Prod_Store::host_uuid();
-		}
-		if ( $host_uuid === '' || ! apply_filters( 'hbc_user_can_access_host', false, get_current_user_id(), $host_uuid ) ) {
+		if ( ! HBC_Prod_Store::is_uuid( $host_uuid ) || ! apply_filters( 'hbc_user_can_access_host', false, get_current_user_id(), $host_uuid ) ) {
 			self::redirect_ops( '', 'This account is not assigned to that organization.' );
 		}
 
@@ -403,6 +502,22 @@ final class HBC_Prod_Admin {
 		self::redirect_ops( (string) ( $result['message'] ?? 'Event updated.' ) );
 	}
 
+	private static function handle_delete_event_post(): void {
+		$event_uuid = sanitize_text_field( (string) ( $_POST['event_uuid'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		$host_uuid  = sanitize_text_field( (string) ( $_POST['host_uuid'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		check_admin_referer( 'hbc_delete_event_' . $event_uuid );
+		$identity = (string) get_user_meta( get_current_user_id(), 'hbc_identity_uuid', true );
+		$mine     = HBC_Prod_Store::host_uuids_for_identity( $identity );
+		if ( ! in_array( $host_uuid, $mine, true ) ) {
+			self::redirect_ops( '', 'Only the host of this organization can delete this event.' );
+		}
+		$result = HBC_Prod_Store::delete_event( $host_uuid, $event_uuid );
+		if ( ! empty( $result['error']['message'] ) ) {
+			self::redirect_ops( '', (string) $result['error']['message'] );
+		}
+		self::redirect_ops( (string) ( $result['message'] ?? 'Event deleted.' ) );
+	}
+
 	private static function handle_review_volunteer_post(): void {
 		check_admin_referer( 'hbc_review_volunteer' );
 		$uuid     = sanitize_text_field( (string) ( $_POST['volunteer_uuid'] ?? '' ) );
@@ -413,31 +528,6 @@ final class HBC_Prod_Admin {
 			self::redirect_ops( '', (string) $result['error']['message'] );
 		}
 		self::redirect_ops( (string) ( $result['message'] ?? 'Volunteer updated.' ) );
-	}
-
-	private static function handle_trade_gate_post(): void {
-		check_admin_referer( 'hbc_trade_gate' );
-		$action = sanitize_key( (string) ( $_POST['trade_action'] ?? '' ) );
-		$reason = sanitize_text_field( (string) ( $_POST['reason'] ?? '' ) );
-		$actor  = wp_get_current_user()->user_login ?: 'super_admin';
-		if ( $action === 'emergency' ) {
-			$result = HBC_Prod_Store::trade_emergency_shutdown( $reason, $actor );
-		} elseif ( $action === 'on' || $action === 'off' ) {
-			$result = HBC_Prod_Store::set_trade_unlocked( $action === 'on', $reason, $actor );
-		} elseif ( $action === 'authorize_seller' || $action === 'revoke_seller' ) {
-			$result = HBC_Prod_Store::set_seller_trade_authorization(
-				sanitize_text_field( (string) ( $_POST['identity_uuid'] ?? '' ) ),
-				$action === 'authorize_seller',
-				$reason,
-				$actor
-			);
-		} else {
-			self::redirect_ops( '', 'Unknown Trade action.' );
-		}
-		if ( ! empty( $result['error']['message'] ) ) {
-			self::redirect_ops( '', (string) $result['error']['message'] );
-		}
-		self::redirect_ops( 'Trade controls updated.' );
 	}
 
 	public static function register_rest(): void {
@@ -465,6 +555,40 @@ final class HBC_Prod_Admin {
 		return $response;
 	}
 
+	private static function render_super_admin_picker(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		$chosen = HBC_Prod_Orgs::designated_super_admin_id();
+		$users  = get_users(
+			array(
+				'orderby' => 'display_name',
+				'order'   => 'ASC',
+				'number'  => 200,
+			)
+		);
+		echo '<form method="post" class="hbc-super-admin-pick" action="' . esc_url( self::ops_url( self::current_ops_tab() ) ) . '">';
+		echo '<input type="hidden" name="hbc_action" value="appoint_super_admin" />';
+		self::hidden_tab( self::current_ops_tab() );
+		wp_nonce_field( 'hbc_appoint_super_admin' );
+		echo '<label for="hbc_super_admin_user">Super Admin</label>';
+		echo '<select name="user_id" id="hbc_super_admin_user">';
+		echo '<option value="">Select a user</option>';
+		foreach ( $users as $user ) {
+			if ( ! ( $user instanceof WP_User ) ) {
+				continue;
+			}
+			$label = (string) $user->user_login;
+			if ( $user->display_name !== '' && $user->display_name !== $user->user_login ) {
+				$label .= ' — ' . $user->display_name;
+			}
+			echo '<option value="' . esc_attr( (string) $user->ID ) . '"' . selected( $chosen, (int) $user->ID, false ) . '>' . esc_html( $label ) . '</option>';
+		}
+		echo '</select>';
+		echo '<button type="submit" class="button">Save</button>';
+		echo '</form>';
+	}
+
 	public static function render_ops(): void {
 		if ( ! current_user_can( 'hbc_admin' ) ) {
 			wp_die( esc_html__( 'Protected access required.', 'hbc-prod' ) );
@@ -486,39 +610,67 @@ final class HBC_Prod_Admin {
 			$class = $key === $tab ? ' nav-tab nav-tab-active' : ' nav-tab';
 			echo '<a href="' . esc_url( self::ops_url( $key ) ) . '" class="' . esc_attr( trim( $class ) ) . '">' . esc_html( $label ) . '</a>';
 		}
+		if ( current_user_can( 'manage_options' ) ) {
+			self::render_super_admin_picker();
+		}
+		if ( current_user_can( 'hbc_super_admin' ) ) {
+			echo '<a class="button button-primary hbc-super-admin-link" href="' . esc_url( home_url( '/super-admin' ) ) . '">Open Super Admin Console</a>';
+		}
 		echo '</nav>';
-		echo '<div class="hbc-admin-panel">';
+		$panel_class = 'hbc-admin-panel' . ( in_array( $tab, array( 'organizations', 'events' ), true ) ? ' hbc-admin-panel-wide' : '' );
+		echo '<div class="' . esc_attr( $panel_class ) . '">';
 		if ( $tab === 'devices' ) {
 			self::render_devices_tab();
 		} elseif ( $tab === 'organizations' ) {
 			self::render_organizations_tab();
-		} elseif ( $tab === 'hosts' ) {
-			self::render_hosts_tab();
 		} elseif ( $tab === 'print' ) {
 			self::render_print_tab();
 		} elseif ( $tab === 'records' ) {
 			self::render_records_tab();
 		} elseif ( $tab === 'status' ) {
 			self::render_status_tab();
-		} elseif ( $tab === 'settings' ) {
-			self::render_settings_tab();
 		} else {
 			self::render_events_tab();
 		}
 		echo '</div></div>';
 		echo '<style>
-			.hbc-admin-tabs{margin-bottom:0}
+			.hbc-admin-tabs{display:flex;align-items:center;flex-wrap:wrap;margin-bottom:0}
+			.hbc-super-admin-pick{margin-left:auto;display:flex;align-items:center;gap:6px}
+			.hbc-super-admin-pick select{max-width:220px}
+			.hbc-admin-tabs .hbc-super-admin-link{margin-left:8px}
 			.hbc-admin-panel{background:#fff;border:1px solid #c3c4c7;border-top:0;padding:4px 20px 20px;max-width:980px}
+			.hbc-admin-panel-wide{max-width:1180px}
+			.hbc-org-table td{vertical-align:middle}
+			.hbc-org-table .hbc-status-cell{white-space:nowrap}
+			.hbc-status-pill{display:inline-block;padding:3px 10px;border-radius:999px;background:#dcdcde;color:#1d2327;font-size:12px;font-weight:600;line-height:1.5;letter-spacing:.01em}
+			.hbc-status-pill.is-active{background:#1f8a4c;color:#fff}
 			.hbc-admin-panel h2{margin-top:1.2em}
 			.hbc-admin-panel .hbc-admin-card{max-width:720px;background:#f6f7f7;border:1px solid #dcdcde;padding:4px 16px 8px;margin:12px 0 20px}
 			.hbc-events-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:1.2em}
 			.hbc-events-head h2{margin:0}
-			.hbc-event-sub{color:#646970;margin:4px 0 0;font-size:12px;line-height:1.4}
-			.hbc-event-actions{white-space:normal}
-			.hbc-event-actions .button{margin:0 6px 6px 0}
+			.hbc-events-table td{vertical-align:middle}
+			.hbc-events-table .hbc-event-name{font-weight:600}
+			.hbc-event-sub{color:#646970;margin:2px 0 0;font-size:12px;line-height:1.4}
+			.hbc-event-actions{white-space:nowrap;text-align:right}
+			.hbc-event-actions form{display:inline}
+			.hbc-event-actions .button{margin:0 0 0 6px}
 			.hbc-events-head .button{flex:0 0 auto}
-			.hbc-event-open{margin-top:4px}
-			.hbc-event-meta{color:#1d2327;margin:6px 0 14px}
+			.hbc-event-back{margin:14px 0 4px}
+			.hbc-event-summary{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin:8px 0 16px}
+			.hbc-event-summary h2{margin:0 0 4px}
+			.hbc-event-kicker{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+			.hbc-event-split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:0 0 16px}
+			.hbc-event-block h3{margin:0 0 8px;font-size:14px}
+			.hbc-event-block .hbc-event-sub{margin:0}
+			.hbc-event-edit{max-width:760px}
+			.hbc-event-edit .form-table{margin-top:0}
+			.hbc-event-edit .form-table th{width:140px;padding:10px 10px 10px 0}
+			.hbc-event-edit input.regular-text,
+			.hbc-event-edit input[type="datetime-local"],
+			.hbc-event-edit select,
+			.hbc-event-edit textarea{width:100%;max-width:460px}
+			.hbc-check{display:inline-block;margin:0 16px 0 0}
+			@media (max-width:900px){.hbc-event-split{grid-template-columns:1fr}.hbc-event-summary{flex-wrap:wrap}}
 			.hbc-modal[hidden]{display:none}
 			.hbc-modal{position:fixed;inset:0;z-index:100000;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px}
 			.hbc-modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
@@ -528,10 +680,51 @@ final class HBC_Prod_Admin {
 		</style>';
 	}
 
+	/**
+	 * Events this account should see, each tagged with its organization.
+	 * A host sees the organizations they host. An administrator also sees every other organization.
+	 *
+	 * @return array{events: list<array<string, mixed>>, my_hosts: list<array{host_uuid: string, name: string}>, is_host: bool}
+	 */
+	private static function events_for_viewer(): array {
+		$user_id  = get_current_user_id();
+		$identity = (string) get_user_meta( $user_id, 'hbc_identity_uuid', true );
+		$mine     = HBC_Prod_Store::host_uuids_for_identity( $identity );
+		$see_all  = current_user_can( 'manage_options' );
+		$orgs     = class_exists( 'HBC_Prod_Orgs' ) ? HBC_Prod_Orgs::list_organizations() : array();
+		$events   = array();
+		$my_hosts = array();
+		foreach ( $orgs as $org ) {
+			$uuid   = (string) ( $org['host_uuid'] ?? '' );
+			$is_mine = in_array( $uuid, $mine, true );
+			if ( $is_mine ) {
+				$my_hosts[] = array(
+					'host_uuid' => $uuid,
+					'name'      => (string) ( $org['name'] ?? '' ),
+				);
+			}
+			if ( ! $see_all && ! $is_mine ) {
+				continue;
+			}
+			$list = HBC_Prod_Store::list_host_events( $uuid );
+			foreach ( is_array( $list['events'] ?? null ) ? $list['events'] : array() as $ev ) {
+				$ev['organization_name'] = (string) ( $org['name'] ?? '' );
+				$ev['host_uuid']         = $uuid;
+				$ev['viewer_is_host']    = $is_mine;
+				$events[]                = $ev;
+			}
+		}
+		return array(
+			'events'   => $events,
+			'my_hosts' => $my_hosts,
+			'is_host'  => $my_hosts !== array(),
+		);
+	}
+
 	private static function render_events_tab(): void {
-		$host  = HBC_Prod_Store::host_uuid();
-		$list  = $host ? HBC_Prod_Store::list_host_events( $host ) : array( 'events' => array(), 'host_name' => '' );
-		$items = is_array( $list['events'] ?? null ) ? $list['events'] : array();
+		$view      = self::events_for_viewer();
+		$items     = $view['events'];
+		$my_hosts  = $view['my_hosts'];
 		$edit_uuid = isset( $_GET['edit'] ) ? sanitize_text_field( (string) wp_unslash( $_GET['edit'] ) ) : '';
 		$edit_ev   = null;
 		foreach ( $items as $ev ) {
@@ -541,80 +734,47 @@ final class HBC_Prod_Admin {
 			}
 		}
 
+		if ( is_array( $edit_ev ) ) {
+			self::render_event_detail( $edit_ev, (string) ( $edit_ev['host_uuid'] ?? '' ) );
+			return;
+		}
+
 		echo '<div class="hbc-events-head"><h2>Events</h2>';
-		if ( $host !== '' ) {
+		if ( $my_hosts ) {
 			echo '<button type="button" class="button button-primary" id="hbc-open-create-event">Create event</button>';
 		}
 		echo '</div>';
-		if ( $host !== '' && (string) ( $list['host_name'] ?? '' ) !== '' ) {
-			echo '<p>Organization: <strong>' . esc_html( (string) $list['host_name'] ) . '</strong>. A published event appears on <a href="' . esc_url( home_url( '/r' ) ) . '">/r</a>.</p>';
+		if ( $view['is_host'] ) {
+			$names = array();
+			foreach ( $my_hosts as $host ) {
+				$names[] = (string) $host['name'];
+			}
+			echo '<p>You host <strong>' . esc_html( implode( ', ', $names ) ) . '</strong>. A published event appears on <a href="' . esc_url( home_url( '/r' ) ) . '">/r</a>.';
+			if ( current_user_can( 'manage_options' ) ) {
+				echo ' Every other organization is listed in its own row.';
+			}
+			echo '</p>';
+		} elseif ( current_user_can( 'manage_options' ) ) {
+			echo '<p>This account is not a host. Each event belongs to the organization shown in its row.</p>';
 		} else {
-			echo '<p>A published event appears on <a href="' . esc_url( home_url( '/r' ) ) . '">/r</a>.</p>';
+			echo '<p>This account is not a host, so it has no events.</p>';
 		}
 
 		$by_event = array();
-		if ( $host !== '' ) {
-			$vols = HBC_Prod_Store::list_volunteers( $host );
+		$seen     = array();
+		foreach ( $items as $ev ) {
+			$host_uuid = (string) ( $ev['host_uuid'] ?? '' );
+			if ( $host_uuid === '' || isset( $seen[ $host_uuid ] ) ) {
+				continue;
+			}
+			$seen[ $host_uuid ] = true;
+			$vols = HBC_Prod_Store::list_volunteers( $host_uuid );
 			foreach ( is_array( $vols['volunteers'] ?? null ) ? $vols['volunteers'] : array() as $v ) {
 				$by_event[ (string) ( $v['event_uuid'] ?? '' ) ][] = $v;
 			}
 		}
 
-		if ( is_array( $edit_ev ) && $host !== '' ) {
-			$event_uuid = (string) $edit_ev['event_uuid'];
-			$starts     = preg_replace( '/:\d{2}$/', '', str_replace( ' ', 'T', substr( (string) ( $edit_ev['starts_at'] ?? '' ), 0, 16 ) ) );
-			$ends       = preg_replace( '/:\d{2}$/', '', str_replace( ' ', 'T', substr( (string) ( $edit_ev['ends_at'] ?? '' ), 0, 16 ) ) );
-			echo '<div class="hbc-event-open">';
-			echo '<p><a href="' . esc_url( self::ops_url( 'events' ) ) . '">&larr; All events</a></p>';
-			echo '<div class="hbc-events-head"><h2>' . esc_html( (string) ( $edit_ev['name'] ?? '' ) ) . '</h2>';
-			if ( (string) ( $edit_ev['status'] ?? '' ) === 'published' ) {
-				echo '<a class="button button-primary" href="' . esc_url( self::encounter_start_url( $event_uuid ) ) . '">Start encounter</a>';
-			}
-			echo '</div>';
-			echo '<p class="hbc-event-meta">' . esc_html( self::event_type_label( (string) ( $edit_ev['event_type'] ?? '' ) ) );
-			echo ' · ' . esc_html( ucfirst( (string) ( $edit_ev['status'] ?? '' ) ) );
-			$code = (string) ( $edit_ev['event_code'] ?? '' );
-			if ( $code !== '' ) {
-				echo ' · <code>' . esc_html( $code ) . '</code>';
-			}
-			echo '<br />' . esc_html( self::format_when( (string) ( $edit_ev['starts_at'] ?? '' ) ) );
-			$location = trim( (string) ( $edit_ev['location'] ?? '' ) );
-			if ( $location !== '' ) {
-				echo ' · ' . esc_html( $location );
-			}
-			echo '</p>';
-			self::render_event_activity( $event_uuid );
-			echo '<form method="post" class="hbc-admin-card" action="' . esc_url( self::ops_url( 'events', array( 'edit' => $event_uuid ) ) ) . '">';
-			echo '<input type="hidden" name="hbc_action" value="update_event" />';
-			self::hidden_tab( 'events' );
-			echo '<input type="hidden" name="hbc_edit" value="' . esc_attr( $event_uuid ) . '" />';
-			echo '<input type="hidden" name="host_uuid" value="' . esc_attr( $host ) . '" />';
-			echo '<input type="hidden" name="event_uuid" value="' . esc_attr( $event_uuid ) . '" />';
-			wp_nonce_field( 'hbc_update_event' );
-			echo '<h3>Edit event</h3>';
-			echo '<table class="form-table" role="presentation"><tbody>';
-			self::field_text( 'name', 'Event name', (string) ( $edit_ev['name'] ?? '' ), true );
-			self::field_text( 'location', 'Location', (string) ( $edit_ev['location'] ?? '' ) );
-			echo '<tr><th scope="row"><label for="hbc_description">Description</label></th><td><textarea name="description" id="hbc_description" class="large-text" rows="3">' . esc_textarea( (string) ( $edit_ev['description'] ?? '' ) ) . '</textarea></td></tr>';
-			echo '<tr><th scope="row"><label for="hbc_starts_at">Starts</label></th><td><input type="datetime-local" name="starts_at" id="hbc_starts_at" value="' . esc_attr( (string) $starts ) . '" /></td></tr>';
-			echo '<tr><th scope="row"><label for="hbc_ends_at">Ends</label></th><td><input type="datetime-local" name="ends_at" id="hbc_ends_at" value="' . esc_attr( (string) $ends ) . '" /></td></tr>';
-			self::field_text( 'event_code', 'Short event code', (string) ( $edit_ev['event_code'] ?? '' ) );
-			echo '<tr><th scope="row"><label for="hbc_status">Status</label></th><td><select name="status" id="hbc_status">';
-			foreach ( array( 'published', 'draft', 'cancelled' ) as $st ) {
-				echo '<option value="' . esc_attr( $st ) . '"' . selected( (string) ( $edit_ev['status'] ?? '' ), $st, false ) . '>' . esc_html( ucfirst( $st ) ) . '</option>';
-			}
-			echo '</select></td></tr>';
-			echo '<tr><th scope="row">RSVP choices</th><td>';
-			echo '<label><input type="checkbox" name="allow_observe" value="1"' . checked( ! empty( $edit_ev['allow_observe'] ), true, false ) . ' /> Observe</label><br />';
-			echo '<label><input type="checkbox" name="allow_participate" value="1"' . checked( ! empty( $edit_ev['allow_participate'] ), true, false ) . ' /> Participate</label>';
-			echo '</td></tr></tbody></table>';
-			echo '<p class="submit"><button type="submit" class="button button-primary">Save event</button></p></form>';
-			echo '</div>';
-		} elseif ( $host === '' ) {
-			echo '<div class="notice notice-warning"><p>Pilot host is not seeded yet. Activate the production-integration plugin, then reload.</p></div>';
-		}
-
-		if ( $host !== '' ) {
+		if ( $my_hosts ) {
 			echo '<div id="hbc-create-event-dialog" class="hbc-modal" hidden>';
 			echo '<div class="hbc-modal-backdrop" data-hbc-close></div>';
 			echo '<div class="hbc-modal-panel" role="dialog" aria-modal="true" aria-labelledby="hbc-create-event-title">';
@@ -622,11 +782,20 @@ final class HBC_Prod_Admin {
 			echo '<form method="post" action="' . esc_url( self::ops_url( 'events' ) ) . '">';
 			echo '<input type="hidden" name="hbc_action" value="create_event" />';
 			self::hidden_tab( 'events' );
-			echo '<input type="hidden" name="host_uuid" value="' . esc_attr( $host ) . '" />';
+			if ( count( $my_hosts ) === 1 ) {
+				echo '<input type="hidden" name="host_uuid" value="' . esc_attr( (string) $my_hosts[0]['host_uuid'] ) . '" />';
+			}
 			wp_nonce_field( 'hbc_create_event' );
 			echo '<h2 id="hbc-create-event-title">Create event</h2>';
 			echo '<p class="description">Optional short code lets people open the event without searching (like <code>STONE</code>).</p>';
 			echo '<table class="form-table" role="presentation"><tbody>';
+			if ( count( $my_hosts ) > 1 ) {
+				echo '<tr><th scope="row"><label for="hbc_create_host">Organization</label></th><td><select name="host_uuid" id="hbc_create_host">';
+				foreach ( $my_hosts as $host ) {
+					echo '<option value="' . esc_attr( (string) $host['host_uuid'] ) . '">' . esc_html( (string) $host['name'] ) . '</option>';
+				}
+				echo '</select></td></tr>';
+			}
 			self::field_text( 'name', 'Event name', '', true, 'text', '', 'hbc_create_name' );
 			echo '<tr><th scope="row"><label for="hbc_create_event_type">Type</label></th><td><select name="event_type" id="hbc_create_event_type">';
 			echo '<option value="community">Community / LAUGH gathering</option>';
@@ -682,16 +851,11 @@ final class HBC_Prod_Admin {
 			</script>';
 		}
 
-		if ( is_array( $edit_ev ) ) {
-			return;
-		}
-
-		echo '<h2>Published and draft events</h2>';
 		if ( ! $items ) {
 			echo '<p>No events yet.</p>';
 		} else {
-			echo '<table class="widefat striped"><thead><tr>';
-			echo '<th>Event</th><th>When</th><th>Status</th><th>Requests</th><th></th>';
+			echo '<table class="widefat striped hbc-events-table"><thead><tr>';
+			echo '<th>Event</th><th>Organization</th><th>When</th><th>Status</th><th>Requests</th><th>Actions</th>';
 			echo '</tr></thead><tbody>';
 			foreach ( $items as $ev ) {
 				$event_uuid = (string) ( $ev['event_uuid'] ?? '' );
@@ -699,37 +863,123 @@ final class HBC_Prod_Admin {
 				$requests   = $by_event[ $event_uuid ] ?? array();
 				$location   = trim( (string) ( $ev['location'] ?? '' ) );
 				$code       = (string) ( $ev['event_code'] ?? '' );
-				echo '<tr>';
-				echo '<td><a href="' . esc_url( $edit_url ) . '"><strong>' . esc_html( (string) ( $ev['name'] ?? '' ) ) . '</strong></a>';
-				echo '<p class="hbc-event-sub">' . esc_html( self::event_type_label( (string) ( $ev['event_type'] ?? '' ) ) );
+				$status     = (string) ( $ev['status'] ?? '' );
+				$meta       = array( self::event_type_label( (string) ( $ev['event_type'] ?? '' ) ) );
 				if ( $code !== '' ) {
-					echo ' · ' . esc_html( $code );
+					$meta[] = $code;
 				}
 				if ( $location !== '' ) {
-					echo '<br />' . esc_html( $location );
+					$meta[] = $location;
 				}
-				echo '</p>';
-				if ( (string) ( $ev['status'] ?? '' ) === 'published' ) {
-					echo '<p style="margin:8px 0 0"><a class="button button-primary" href="' . esc_url( self::encounter_start_url( $event_uuid ) ) . '">Start encounter</a></p>';
-				}
-				echo '</td>';
+				echo '<tr>';
+				echo '<td><a class="hbc-event-name" href="' . esc_url( $edit_url ) . '">' . esc_html( (string) ( $ev['name'] ?? '' ) ) . '</a>';
+				echo '<p class="hbc-event-sub">' . esc_html( implode( ' · ', $meta ) ) . '</p></td>';
+				echo '<td>' . esc_html( (string) ( $ev['organization_name'] ?? '' ) ) . '</td>';
 				echo '<td>' . esc_html( self::format_when( (string) ( $ev['starts_at'] ?? '' ) ) ) . '</td>';
-				echo '<td>' . esc_html( ucfirst( (string) ( $ev['status'] ?? '' ) ) ) . '</td>';
+				echo '<td>' . self::status_pill( $status ) . '</td>';
 				echo '<td><a href="' . esc_url( $edit_url ) . '">' . esc_html( self::request_label( $requests ) ) . '</a></td>';
-				echo '<td class="hbc-event-actions"><a class="button button-small" href="' . esc_url( $edit_url ) . '">Open</a></td></tr>';
+				echo '<td class="hbc-event-actions">';
+				if ( $status === 'published' && ! empty( $ev['viewer_is_host'] ) ) {
+					echo '<a class="button button-primary" href="' . esc_url( self::encounter_start_url( $event_uuid ) ) . '">Start encounter</a>';
+				}
+				echo '<a class="button" href="' . esc_url( $edit_url ) . '">Open</a>';
+				if ( ! empty( $ev['viewer_is_host'] ) ) {
+					$ask = wp_json_encode( 'Delete ' . (string) ( $ev['name'] ?? 'this event' ) . '? Its RSVPs and encounters are removed.' );
+					echo '<form method="post" action="' . esc_url( self::ops_url( 'events' ) ) . '" onsubmit="return confirm(' . esc_attr( (string) $ask ) . ');">';
+					echo '<input type="hidden" name="hbc_action" value="delete_event" />';
+					self::hidden_tab( 'events' );
+					echo '<input type="hidden" name="host_uuid" value="' . esc_attr( (string) ( $ev['host_uuid'] ?? '' ) ) . '" />';
+					echo '<input type="hidden" name="event_uuid" value="' . esc_attr( $event_uuid ) . '" />';
+					wp_nonce_field( 'hbc_delete_event_' . $event_uuid );
+					echo '<button type="submit" class="button button-link-delete">Delete</button>';
+					echo '</form>';
+				}
+				echo '</td></tr>';
 			}
 			echo '</tbody></table>';
+		}
+	}
+
+	/**
+	 * @param array<string, mixed> $event
+	 */
+	private static function render_event_detail( array $event, string $host ): void {
+		$event_uuid = (string) ( $event['event_uuid'] ?? '' );
+		$status     = (string) ( $event['status'] ?? '' );
+		$code       = (string) ( $event['event_code'] ?? '' );
+		$location   = trim( (string) ( $event['location'] ?? '' ) );
+		$meta       = array();
+		if ( (string) ( $event['organization_name'] ?? '' ) !== '' ) {
+			$meta[] = (string) $event['organization_name'];
+		}
+		$meta[] = self::event_type_label( (string) ( $event['event_type'] ?? '' ) );
+		if ( $code !== '' ) {
+			$meta[] = $code;
+		}
+		$when = self::format_when( (string) ( $event['starts_at'] ?? '' ) );
+		if ( $when !== '—' ) {
+			$meta[] = $when;
+		}
+		echo '<p class="hbc-event-back"><a href="' . esc_url( self::ops_url( 'events' ) ) . '">&larr; All events</a></p>';
+		echo '<div class="hbc-event-summary">';
+		echo '<div><h2>' . esc_html( (string) ( $event['name'] ?? '' ) ) . '</h2>';
+		echo '<p class="hbc-event-sub">' . esc_html( implode( ' · ', $meta ) ) . '</p>';
+		if ( $location !== '' ) {
+			echo '<p class="hbc-event-sub">' . esc_html( $location ) . '</p>';
+		}
+		echo '</div><div class="hbc-event-kicker">';
+		echo self::status_pill( $status );
+		if ( $status === 'published' && ! empty( $event['viewer_is_host'] ) ) {
+			echo '<a class="button button-primary" href="' . esc_url( self::encounter_start_url( $event_uuid ) ) . '">Start encounter</a>';
+		}
+		echo '</div></div>';
+		self::render_event_activity( $event_uuid );
+		echo '<form method="post" class="hbc-admin-card hbc-event-edit" action="' . esc_url( self::ops_url( 'events', array( 'edit' => $event_uuid ) ) ) . '">';
+		echo '<input type="hidden" name="hbc_action" value="update_event" />';
+		self::hidden_tab( 'events' );
+		echo '<input type="hidden" name="hbc_edit" value="' . esc_attr( $event_uuid ) . '" />';
+		echo '<input type="hidden" name="host_uuid" value="' . esc_attr( $host ) . '" />';
+		echo '<input type="hidden" name="event_uuid" value="' . esc_attr( $event_uuid ) . '" />';
+		wp_nonce_field( 'hbc_update_event' );
+		echo '<h3>Edit event</h3>';
+		echo '<table class="form-table" role="presentation"><tbody>';
+		self::field_text( 'name', 'Event name', (string) ( $event['name'] ?? '' ), true );
+		self::field_text( 'location', 'Location', (string) ( $event['location'] ?? '' ) );
+		echo '<tr><th scope="row"><label for="hbc_description">Description</label></th><td><textarea name="description" id="hbc_description" rows="3">' . esc_textarea( (string) ( $event['description'] ?? '' ) ) . '</textarea></td></tr>';
+		echo '<tr><th scope="row"><label for="hbc_starts_at">Starts</label></th><td><input type="datetime-local" name="starts_at" id="hbc_starts_at" value="' . esc_attr( self::datetime_local_value( (string) ( $event['starts_at'] ?? '' ) ) ) . '" /></td></tr>';
+		echo '<tr><th scope="row"><label for="hbc_ends_at">Ends</label></th><td><input type="datetime-local" name="ends_at" id="hbc_ends_at" value="' . esc_attr( self::datetime_local_value( (string) ( $event['ends_at'] ?? '' ) ) ) . '" /></td></tr>';
+		self::field_text( 'event_code', 'Short event code', (string) ( $event['event_code'] ?? '' ) );
+		echo '<tr><th scope="row"><label for="hbc_status">Status</label></th><td><select name="status" id="hbc_status">';
+		foreach ( array( 'published', 'draft', 'cancelled' ) as $st ) {
+			echo '<option value="' . esc_attr( $st ) . '"' . selected( $status, $st, false ) . '>' . esc_html( ucfirst( $st ) ) . '</option>';
+		}
+		echo '</select></td></tr>';
+		echo '<tr><th scope="row">RSVP choices</th><td>';
+		echo '<label class="hbc-check"><input type="checkbox" name="allow_observe" value="1"' . checked( ! empty( $event['allow_observe'] ), true, false ) . ' /> Observe</label>';
+		echo '<label class="hbc-check"><input type="checkbox" name="allow_participate" value="1"' . checked( ! empty( $event['allow_participate'] ), true, false ) . ' /> Participate</label>';
+		echo '</td></tr></tbody></table>';
+		echo '<p class="submit"><button type="submit" class="button button-primary">Save event</button></p></form>';
+		if ( ! empty( $event['viewer_is_host'] ) ) {
+			$ask = wp_json_encode( 'Delete ' . (string) ( $event['name'] ?? 'this event' ) . '? Its RSVPs and encounters are removed.' );
+			echo '<form method="post" action="' . esc_url( self::ops_url( 'events' ) ) . '" onsubmit="return confirm(' . esc_attr( (string) $ask ) . ');">';
+			echo '<input type="hidden" name="hbc_action" value="delete_event" />';
+			self::hidden_tab( 'events' );
+			echo '<input type="hidden" name="host_uuid" value="' . esc_attr( $host ) . '" />';
+			echo '<input type="hidden" name="event_uuid" value="' . esc_attr( $event_uuid ) . '" />';
+			wp_nonce_field( 'hbc_delete_event_' . $event_uuid );
+			echo '<p><button type="submit" class="button button-link-delete">Delete event</button></p></form>';
 		}
 	}
 
 	private static function render_event_activity( string $event_uuid ): void {
 		$activity = HBC_Prod_Store::activity_for_event( $event_uuid );
 		$requests = $activity['requests'];
-		echo '<h3>Volunteer requests (' . count( $requests ) . ')</h3>';
+		echo '<div class="hbc-event-split">';
+		echo '<section class="hbc-event-block"><h3>Volunteer requests (' . count( $requests ) . ')</h3>';
 		if ( ! $requests ) {
-			echo '<p>No volunteer requests for this event.</p>';
+			echo '<p class="hbc-event-sub">None for this event.</p>';
 		} else {
-			echo '<table class="widefat striped"><thead><tr><th>Request</th><th>State</th><th>When</th><th>Actions</th></tr></thead><tbody>';
+			echo '<table class="widefat striped hbc-events-table"><thead><tr><th>Request</th><th>State</th><th>When</th><th></th></tr></thead><tbody>';
 			foreach ( $requests as $v ) {
 				$choice = (string) ( $v['choice'] ?? '' );
 				$choice = $choice === 'participate' ? 'Participate' : ( $choice === 'walk_away' ? 'Walk away' : ( $choice === 'observe' ? 'Observe' : ucfirst( $choice ) ) );
@@ -739,43 +989,42 @@ final class HBC_Prod_Admin {
 				}
 				echo '<tr>';
 				echo '<td>' . esc_html( $choice ) . '</td>';
-				echo '<td>' . esc_html( ucfirst( $state ) ) . '</td>';
+				echo '<td>' . self::status_pill( $state ) . '</td>';
 				echo '<td>' . esc_html( self::format_when( (string) ( $v['created_at'] ?? '' ) ) ) . '</td>';
-				echo '<td>';
+				echo '<td class="hbc-event-actions">';
 				if ( $state === 'requested' && (string) ( $v['volunteer_request_uuid'] ?? '' ) !== '' ) {
-					echo '<form method="post" action="' . esc_url( self::ops_url( 'events' ) ) . '" style="display:inline">';
+					echo '<form method="post" action="' . esc_url( self::ops_url( 'events', array( 'edit' => $event_uuid ) ) ) . '">';
 					echo '<input type="hidden" name="hbc_action" value="review_volunteer" />';
 					self::hidden_tab( 'events' );
 					echo '<input type="hidden" name="hbc_edit" value="' . esc_attr( $event_uuid ) . '" />';
 					echo '<input type="hidden" name="volunteer_uuid" value="' . esc_attr( (string) $v['volunteer_request_uuid'] ) . '" />';
 					echo '<input type="hidden" name="_wpnonce" value="' . esc_attr( wp_create_nonce( 'hbc_review_volunteer' ) ) . '" />';
-					echo '<button class="button button-primary" type="submit" name="decision" value="accepted">Accept</button> ';
+					echo '<button class="button button-primary" type="submit" name="decision" value="accepted">Accept</button>';
 					echo '<button class="button" type="submit" name="decision" value="declined">Decline</button>';
 					echo '</form>';
-				} else {
-					echo '—';
 				}
 				echo '</td></tr>';
 			}
 			echo '</tbody></table>';
 		}
+		echo '</section>';
 		$total = (int) $activity['encounter_total'];
-		echo '<h3>Total encounters: ' . $total . '</h3>';
+		echo '<section class="hbc-event-block"><h3>Encounters (' . $total . ')</h3>';
 		if ( ! $total ) {
-			echo '<p>No encounters for this event.</p>';
+			echo '<p class="hbc-event-sub">None for this event.</p></section></div>';
 			return;
 		}
-		echo '<table class="widefat striped"><thead><tr><th>Type</th><th>State</th><th>When</th></tr></thead><tbody>';
+		echo '<table class="widefat striped hbc-events-table"><thead><tr><th>Type</th><th>State</th><th>When</th></tr></thead><tbody>';
 		foreach ( $activity['encounters'] as $encounter ) {
 			$type = (string) ( $encounter['encounter_type'] ?? '' );
 			$type = $type === 'presence' ? 'Presence' : ( $type === 'gratitude' ? 'Gratitude' : ( $type === 'trade' ? 'Trade' : ucfirst( $type ) ) );
 			echo '<tr>';
 			echo '<td>' . esc_html( $type ) . '</td>';
-			echo '<td>' . esc_html( ucfirst( str_replace( '_', ' ', (string) ( $encounter['state'] ?? '' ) ) ) ) . '</td>';
+			echo '<td>' . self::status_pill( (string) ( $encounter['state'] ?? '' ) ) . '</td>';
 			echo '<td>' . esc_html( self::format_when( (string) ( $encounter['issued_at'] ?? '' ) ) ) . '</td>';
 			echo '</tr>';
 		}
-		echo '</tbody></table>';
+		echo '</tbody></table></section></div>';
 	}
 
 	private static function encounter_start_url( string $event_uuid ): string {
@@ -797,6 +1046,24 @@ final class HBC_Prod_Admin {
 			return 'Community';
 		}
 		return $type !== '' ? $type : 'Event';
+	}
+
+	private static function status_pill( string $status ): string {
+		$good  = in_array( strtolower( $status ), array( 'published', 'active', 'accepted' ), true );
+		$class = 'hbc-status-pill' . ( $good ? ' is-active' : '' );
+		$label = $status !== '' ? ucfirst( str_replace( '_', ' ', $status ) ) : '—';
+		return '<span class="' . esc_attr( $class ) . '">' . esc_html( $label ) . '</span>';
+	}
+
+	private static function datetime_local_value( string $iso ): string {
+		if ( $iso === '' ) {
+			return '';
+		}
+		$ts = strtotime( $iso );
+		if ( ! $ts ) {
+			return '';
+		}
+		return wp_date( 'Y-m-d\TH:i', $ts );
 	}
 
 	private static function format_when( string $iso ): string {
@@ -873,57 +1140,54 @@ final class HBC_Prod_Admin {
 		echo '</tbody></table>';
 	}
 
-	private static function render_hosts_tab(): void {
-		if ( ! current_user_can( 'manage_options' ) ) {
-			echo '<p>An administrator can see who is a host.</p>';
-			return;
-		}
-		echo '<h2>Hosts</h2>';
-		echo '<p>These WordPress users are organizers. The WordPress role stays separate from the host assignment. The same list is the Host column on <a href="' . esc_url( admin_url( 'users.php' ) ) . '">Users</a>.</p>';
-		$rows = HBC_Prod_Store::list_wordpress_hosts();
-		if ( ! $rows ) {
-			echo '<p>No hosts yet.</p>';
-			return;
-		}
-		echo '<table class="widefat striped"><thead><tr>';
-		echo '<th>User</th><th>WordPress role</th><th>Organization</th><th>Email</th>';
-		echo '</tr></thead><tbody>';
-		foreach ( $rows as $row ) {
-			$name = (string) ( $row['display_name'] ?? '' );
-			if ( $name === '' ) {
-				$name = (string) ( $row['user_login'] ?? 'Host' );
-			}
-			echo '<tr><td>';
-			if ( ! empty( $row['edit_url'] ) ) {
-				echo '<a href="' . esc_url( (string) $row['edit_url'] ) . '">' . esc_html( $name ) . '</a>';
-			} else {
-				echo esc_html( $name );
-			}
-			if ( (string) ( $row['user_login'] ?? '' ) !== '' ) {
-				echo '<br><code>' . esc_html( (string) $row['user_login'] ) . '</code>';
-			}
-			echo '</td>';
-			echo '<td>' . esc_html( (string) ( $row['roles'] !== '' ? $row['roles'] : '—' ) ) . '</td>';
-			echo '<td>' . esc_html( (string) ( $row['organization'] ?? '' ) ) . '</td>';
-			echo '<td>' . esc_html( (string) ( $row['user_email'] !== '' ? $row['user_email'] : '—' ) ) . '</td>';
-			echo '</tr>';
-		}
-		echo '</tbody></table>';
-	}
-
 	private static function render_organizations_tab(): void {
 		echo '<div class="hbc-events-head"><h2>Organizations</h2>';
 		echo '<button type="button" class="button button-primary" id="hbc-open-register-org">Register organization</button>';
 		echo '</div>';
 		echo '<p>Register a church or community here. Each one gets a public code for <code>/r?org=CODE</code>.</p>';
-		$orgs = HBC_Prod_Orgs::list_organizations();
+		$orgs    = HBC_Prod_Orgs::list_organizations();
+		$members = HBC_Prod_Store::members_by_organization();
 		if ( $orgs ) {
-			echo '<table class="widefat striped"><thead><tr><th>Name</th><th>Code</th><th>Entry</th><th>Status</th></tr></thead><tbody>';
+			echo '<table class="widefat striped hbc-org-table"><thead><tr><th>Name</th><th>Code</th><th>Entry</th><th>People</th><th>Email</th><th>Phone</th><th>Status</th><th></th></tr></thead><tbody>';
 			foreach ( $orgs as $org ) {
 				echo '<tr><td>' . esc_html( (string) $org['name'] ) . '</td>';
 				echo '<td><code>' . esc_html( (string) ( $org['public_code'] ?: '—' ) ) . '</code></td>';
 				echo '<td><a href="' . esc_url( (string) $org['org_entry'] ) . '">' . esc_html( (string) $org['org_entry'] ) . '</a></td>';
-				echo '<td>' . esc_html( (string) $org['status'] ) . '</td></tr>';
+				$people = $members[ (string) $org['host_uuid'] ] ?? array();
+				if ( ! $people ) {
+					echo '<td>—</td><td>—</td><td>—</td>';
+				} else {
+					echo '<td>';
+					foreach ( $people as $person ) {
+						echo '<div style="margin:0 0 8px"><strong>' . esc_html( (string) $person['role'] ) . '</strong> ' . esc_html( (string) $person['username'] ) . '</div>';
+					}
+					echo '</td><td>';
+					foreach ( $people as $person ) {
+						echo '<div style="margin:0 0 8px">' . esc_html( (string) $person['email'] ) . '</div>';
+					}
+					echo '</td><td>';
+					foreach ( $people as $person ) {
+						echo '<div style="margin:0 0 8px">' . esc_html( (string) $person['phone'] ) . '</div>';
+					}
+					echo '</td>';
+				}
+				$status = (string) $org['status'];
+				$pill   = 'hbc-status-pill' . ( $status === 'active' ? ' is-active' : '' );
+				$label  = $status !== '' ? ucfirst( $status ) : '—';
+				echo '<td class="hbc-status-cell"><span class="' . esc_attr( $pill ) . '">' . esc_html( $label ) . '</span></td>';
+				echo '<td class="hbc-event-actions">';
+				if ( current_user_can( 'manage_options' ) ) {
+					$host_uuid = (string) $org['host_uuid'];
+					$ask       = wp_json_encode( 'Delete ' . (string) $org['name'] . '? Its events and public code are removed. The host account stays.' );
+					echo '<form method="post" action="' . esc_url( self::ops_url( 'organizations' ) ) . '" onsubmit="return confirm(' . esc_attr( (string) $ask ) . ');">';
+					echo '<input type="hidden" name="hbc_action" value="delete_org" />';
+					self::hidden_tab( 'organizations' );
+					echo '<input type="hidden" name="host_uuid" value="' . esc_attr( $host_uuid ) . '" />';
+					wp_nonce_field( 'hbc_delete_org_' . $host_uuid );
+					echo '<button type="submit" class="button button-link-delete">Delete</button>';
+					echo '</form>';
+				}
+				echo '</td></tr>';
 			}
 			echo '</tbody></table>';
 		} else {
@@ -944,7 +1208,7 @@ final class HBC_Prod_Admin {
 		echo '<tr><th scope="row"><label for="hbc_org_type">Type</label></th><td><select name="org_type" id="hbc_org_type">';
 		echo '<option value="church">Church</option><option value="community">Community</option><option value="nonprofit">Nonprofit</option>';
 		echo '</select></td></tr>';
-		self::field_text( 'public_code', 'Public code (optional)', '', false, 'text', '4–16 characters. Leave blank to choose one automatically.' );
+		self::field_text( 'public_code', 'Public code (optional)', '', false, 'text', '4–16 characters. It must be different from every other organization. Leave blank to choose one automatically.' );
 		echo '</tbody></table>';
 		echo '<p class="submit"><button type="submit" class="button button-primary">Register organization</button> ';
 		echo '<button type="button" class="button" data-hbc-close>Cancel</button></p>';
@@ -978,9 +1242,8 @@ final class HBC_Prod_Admin {
 
 	private static function render_print_tab(): void {
 		echo '<h2>Print</h2>';
-		echo '<p>Postcards and door QR links. The postcard QR points at <code>/r</code>.</p>';
-		echo '<p><a class="button button-primary" href="' . esc_url( home_url( '/print-studio' ) ) . '" target="_blank" rel="noopener noreferrer">Open Print Studio</a> ';
-		echo '<a class="button" href="' . esc_url( admin_url( 'admin.php?page=hbc-print-studio' ) ) . '">Door QR links</a></p>';
+		echo '<p>Postcards. The postcard QR points at <code>/r</code>.</p>';
+		echo '<p><a class="button button-primary" href="' . esc_url( home_url( '/print-studio' ) ) . '" target="_blank" rel="noopener noreferrer">Open Print Studio</a></p>';
 	}
 
 	private static function render_records_tab(): void {
@@ -993,46 +1256,6 @@ final class HBC_Prod_Admin {
 		echo '<p><button type="submit" class="button button-primary">Generate this-month snapshot</button></p></form>';
 		$snap = HBC_Prod_Orgs::reconcile_snapshot();
 		echo '<pre style="max-width:720px;background:#f6f7f7;padding:12px;border:1px solid #dcdcde;overflow:auto">' . esc_html( wp_json_encode( $snap, JSON_PRETTY_PRINT ) ) . '</pre>';
-	}
-
-	private static function render_settings_tab(): void {
-		if ( ! current_user_can( 'hbc_super_admin' ) ) {
-			echo '<p>Super Admin access is required for these controls.</p>';
-			return;
-		}
-		echo '<h2>Settings</h2>';
-		echo '<p><a class="button button-primary" href="' . esc_url( home_url( '/super-admin' ) ) . '">Open Super Admin Console</a></p>';
-
-		$allowed = HBC_Prod_Orgs::allowed_super_admin_ids();
-		echo '<h2>Super Admin allowlist</h2>';
-		echo '<p>Up to two user IDs.</p>';
-		echo '<form method="post" class="hbc-admin-card" action="' . esc_url( self::ops_url( 'settings' ) ) . '">';
-		echo '<input type="hidden" name="hbc_action" value="super_admin_allowlist" />';
-		self::hidden_tab( 'settings' );
-		wp_nonce_field( 'hbc_super_admin_allowlist' );
-		echo '<p><input class="regular-text" name="user_ids" value="' . esc_attr( implode( ', ', $allowed ) ) . '" /> ';
-		echo '<button class="button button-primary" type="submit">Save allowlist</button></p></form>';
-
-		$tstatus = HBC_Prod_Store::trade_status();
-		echo '<h2>Trade</h2>';
-		echo '<form method="post" class="hbc-admin-card" action="' . esc_url( self::ops_url( 'settings' ) ) . '">';
-		echo '<input type="hidden" name="hbc_action" value="trade_gate" />';
-		self::hidden_tab( 'settings' );
-		wp_nonce_field( 'hbc_trade_gate' );
-		echo '<p>Platform: <strong>' . ( ! empty( $tstatus['platform_on'] ) ? 'LIVE' : 'OFF' ) . '</strong>';
-		if ( ! empty( $tstatus['emergency_locked'] ) ) {
-			echo ' · emergency until ' . esc_html( (string) $tstatus['emergency_lock_until'] );
-		}
-		echo '</p>';
-		echo '<p><label>Reason <input class="regular-text" type="text" name="reason" required /></label></p>';
-		echo '<p><label>Seller identity UUID (for authorize/revoke) <input class="regular-text" type="text" name="identity_uuid" /></label></p>';
-		echo '<p>';
-		echo '<button class="button button-primary" type="submit" name="trade_action" value="on">Turn ON</button> ';
-		echo '<button class="button" type="submit" name="trade_action" value="off">Turn OFF</button> ';
-		echo '<button class="button" type="submit" name="trade_action" value="emergency" onclick="return confirm(\'Emergency lock Trade OFF for 24 hours?\');">Emergency</button> ';
-		echo '<button class="button" type="submit" name="trade_action" value="authorize_seller">Authorize seller</button> ';
-		echo '<button class="button" type="submit" name="trade_action" value="revoke_seller">Revoke seller</button>';
-		echo '</p></form>';
 	}
 
 	private static function render_status_tab(): void {

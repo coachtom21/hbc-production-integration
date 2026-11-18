@@ -165,7 +165,16 @@ final class HBC_Production_Adapters {
 		$identity = $device_token ? HBC_Prod_Store::resolve_token( (string) $device_token ) : false;
 		$registered = (bool) $identity;
 		$assignment = $registered ? HBC_Prod_Store::assignment( (string) $identity, (string) $event_uuid ) : false;
-		$operator   = is_array( $assignment ) && in_array( (string) ( $assignment['role'] ?? '' ), array( 'host', 'greeter' ), true );
+		$logged_in_identity = '';
+		if ( is_user_logged_in() ) {
+			$logged_in_identity = (string) get_user_meta( get_current_user_id(), 'hbc_identity_uuid', true );
+		}
+		$operator = $registered
+			&& is_user_logged_in()
+			&& is_array( $assignment )
+			&& (string) ( $assignment['role'] ?? '' ) === 'host'
+			&& $logged_in_identity !== ''
+			&& $logged_in_identity === (string) $identity;
 
 		$route_view = 'device_registration';
 		if ( $registered && $operator ) {
@@ -186,7 +195,7 @@ final class HBC_Production_Adapters {
 		if ( $host ) {
 			$out['organization'] = array( 'name' => $host->name );
 		}
-		if ( $registered ) {
+		if ( $operator ) {
 			$organizer = HBC_Prod_Store::organizer_profile( (string) $identity );
 			if ( $organizer ) {
 				$out['organizer'] = $organizer;

@@ -1334,6 +1334,41 @@ final class HBC_Prod_Store {
 	}
 
 	/**
+	 * Remove one event that belongs to this organization, including its code, RSVPs, and encounters.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function delete_event( string $host_uuid, string $event_uuid ): array {
+		global $wpdb;
+		$event = self::get_event( $event_uuid );
+		if ( ! $event || (string) $event->host_uuid !== $host_uuid ) {
+			return array(
+				'error' => array(
+					'code'    => 'event_unavailable',
+					'message' => 'That event was not found for this organization.',
+				),
+			);
+		}
+		$name   = (string) $event->name;
+		$prefix = $wpdb->prefix;
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE v FROM {$prefix}hbc_volunteer_requests v
+				INNER JOIN {$prefix}hbc_rsvps r ON r.rsvp_uuid = v.rsvp_uuid
+				WHERE r.event_uuid = %s",
+				$event_uuid
+			)
+		);
+		foreach ( array( 'hbc_attendance_sessions', 'hbc_rsvps', 'hbc_event_codes', 'hbc_events' ) as $table ) {
+			$wpdb->delete( $prefix . $table, array( 'event_uuid' => $event_uuid ) );
+		}
+		return array(
+			'event_uuid' => $event_uuid,
+			'message'    => $name . ' was deleted.',
+		);
+	}
+
+	/**
 	 * Volunteer queue for a host.
 	 *
 	 * @return array{volunteers: list<array<string, mixed>>}
@@ -2075,53 +2110,37 @@ final class HBC_Prod_Store {
 	}
 
 	/**
-	 * WordPress accounts that are active hosts, for the administrator.
+	 * Active host and greeter accounts for each organization.
 	 *
-	 * @return list<array<string, mixed>>
+	 * @return array<string, list<array<string, string>>>
 	 */
-	public static function list_wordpress_hosts(): array {
-		$orgs = self::host_organizations_by_identity();
-		$out  = array();
-		foreach ( $orgs as $identity => $names ) {
-			$users = get_users(
-				array(
-					'meta_key'   => 'hbc_identity_uuid',
-					'meta_value' => $identity,
-					'number'     => 20,
-				)
+	public static function members_by_organization(): array {
+		global $wpdb;
+		$rows = $wpdb->get_results(
+			"SELECT a.host_uuid, a.identity_uuid, a.role_key, i.phone_ciphertext, i.email_ciphertext
+			FROM {$wpdb->prefix}hbc_host_assignments a
+			LEFT JOIN {$wpdb->prefix}hbc_identities i ON i.identity_uuid = a.identity_uuid
+			WHERE a.revoked_at IS NULL
+			AND a.role_key IN ('host','greeter')
+			AND a.starts_at <= UTC_TIMESTAMP() AND (a.ends_at IS NULL OR a.ends_at >= UTC_TIMESTAMP())
+			ORDER BY FIELD(a.role_key, 'host', 'greeter'), a.starts_at ASC"
+		);
+		$out = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$host_uuid = (string) $row->host_uuid;
+			$identity  = (string) $row->identity_uuid;
+			$user_id   = self::wp_user_for_identity( $identity );
+			$user      = $user_id > 0 ? get_userdata( $user_id ) : false;
+			$username  = ( $user instanceof WP_User ) ? (string) $user->user_login : '';
+			$email     = ( $user instanceof WP_User && is_email( $user->user_email ) ) ? (string) $user->user_email : self::unseal( (string) ( $row->email_ciphertext ?? '' ) );
+			$phone     = trim( (string) self::unseal( (string) ( $row->phone_ciphertext ?? '' ) ) );
+			$phone_out = $phone !== '' ? $phone : '—';
+			$out[ $host_uuid ][] = array(
+				'role'     => (string) $row->role_key === 'greeter' ? 'Greeter' : 'Host',
+				'username' => $username !== '' ? $username : 'Phone organizer',
+				'email'    => $email !== '' ? $email : '—',
+				'phone'    => $phone_out,
 			);
-			$organization = implode( ', ', $names );
-			if ( ! $users ) {
-				$out[] = array(
-					'user_id'      => 0,
-					'display_name' => 'Phone organizer',
-					'user_login'   => '',
-					'user_email'   => '',
-					'roles'        => '',
-					'organization' => $organization,
-					'edit_url'     => '',
-				);
-				continue;
-			}
-			$role_names = wp_roles()->role_names;
-			foreach ( $users as $user ) {
-				if ( ! $user instanceof WP_User ) {
-					continue;
-				}
-				$labels = array();
-				foreach ( (array) $user->roles as $role ) {
-					$labels[] = translate_user_role( (string) ( $role_names[ $role ] ?? $role ) );
-				}
-				$out[] = array(
-					'user_id'      => (int) $user->ID,
-					'display_name' => (string) $user->display_name,
-					'user_login'   => (string) $user->user_login,
-					'user_email'   => (string) $user->user_email,
-					'roles'        => implode( ', ', $labels ),
-					'organization' => $organization,
-					'edit_url'     => get_edit_user_link( $user->ID ),
-				);
-			}
 		}
 		return $out;
 	}
@@ -2225,7 +2244,7 @@ final class HBC_Prod_Store {
 	/**
 	 * @return list<string>
 	 */
-	private static function host_uuids_for_identity( string $identity_uuid ): array {
+	public static function host_uuids_for_identity( string $identity_uuid ): array {
 		global $wpdb;
 		if ( ! self::is_uuid( $identity_uuid ) ) {
 			return array();
@@ -2584,7 +2603,20 @@ final class HBC_Prod_Store {
 	 */
 	public static function encounter_start_block( string $operator_identity, string $event_uuid ): ?array {
 		$assignment = self::assignment( $operator_identity, $event_uuid );
-		if ( is_array( $assignment ) && in_array( (string) $assignment['role'], array( 'host', 'greeter' ), true ) ) {
+		if ( is_array( $assignment ) && (string) $assignment['role'] === 'host' ) {
+			if ( ! is_user_logged_in() ) {
+				return array(
+					'code'    => 'login_required',
+					'message' => 'Log in as the host of this event to start an Encounter.',
+				);
+			}
+			$logged_in_identity = (string) get_user_meta( get_current_user_id(), 'hbc_identity_uuid', true );
+			if ( $logged_in_identity === '' || $logged_in_identity !== $operator_identity ) {
+				return array(
+					'code'    => 'host_required',
+					'message' => 'Only the logged-in host of this event can start an Encounter.',
+				);
+			}
 			return null;
 		}
 		if ( ! self::identity_is_active_miner( $operator_identity ) ) {
