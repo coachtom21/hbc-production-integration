@@ -54,6 +54,7 @@ add_action(
 	99
 );
 add_action( 'init', array( 'HBC_Prod_Store', 'maybe_open_local_registration' ), 40 );
+add_action( 'init', array( 'HBC_Prod_Store', 'backfill_encounter_xp_ledger' ), 50 );
 add_action( 'admin_menu', array( 'HBC_Prod_Admin', 'menu' ) );
 add_filter( 'manage_users_columns', array( 'HBC_Prod_Admin', 'users_columns' ) );
 add_filter( 'manage_users_custom_column', array( 'HBC_Prod_Admin', 'users_column' ), 10, 3 );

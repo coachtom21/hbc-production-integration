@@ -3059,48 +3059,116 @@ final class HBC_Prod_Store {
 	}
 
 	public static function issue_xp( string $confirmation_id, string $identity_uuid, string $session_uuid ): string {
-		$key = 'hbc_xp_' . $confirmation_id;
-		if ( get_option( $key ) ) {
-			$existing = get_option( $key );
-			if ( is_array( $existing ) && sanitize_key( (string) ( $existing['status'] ?? '' ) ) === 'extinguished' ) {
-				return 'extinguished';
-			}
-			return 'issued';
+		$key      = 'hbc_xp_' . $confirmation_id;
+		$existing = get_option( $key );
+		if ( is_array( $existing ) && sanitize_key( (string) ( $existing['status'] ?? '' ) ) === 'extinguished' ) {
+			return 'extinguished';
 		}
-		update_option(
-			$key,
-			array(
+
+		$first = ! is_array( $existing );
+		if ( $first ) {
+			$existing = array(
 				'amount'        => self::XP_AMOUNT,
 				'identity_uuid' => $identity_uuid,
 				'session_uuid'  => $session_uuid,
 				'status'        => 'issued',
 				'issued_at'     => self::now(),
-			),
-			false
+			);
+			update_option( $key, $existing, false );
+		}
+
+		self::persist_encounter_xp_row(
+			$confirmation_id,
+			(string) ( $existing['identity_uuid'] ?? $identity_uuid ),
+			(string) ( $existing['session_uuid'] ?? $session_uuid ),
+			(string) ( $existing['amount'] ?? self::XP_AMOUNT ),
+			true
 		);
-		$user_id = self::wp_user_for_identity( $identity_uuid );
-		if ( $user_id > 0 && class_exists( 'Cpm_Humanblockchain_Xp_Ledger' ) ) {
-			do_action(
-				'cpm_hb_xp_ledger_row_saved',
+
+		if ( $first ) {
+			self::mirror_xp_to_smallstreet(
 				array(
-					'wp_user_id'     => $user_id,
-					'scan_type'      => 'human_gold_encounter',
-					'transaction_id' => $confirmation_id,
-					'xp_units'       => self::XP_AMOUNT,
-					'scan_status'    => 'confirmed',
-					'event_kind'     => 'insert',
+					'confirmation_id' => $confirmation_id,
+					'identity_uuid'   => $identity_uuid,
+					'amount'          => self::XP_AMOUNT,
+					'source'          => 'human_gold_encounter',
 				)
 			);
 		}
-		self::mirror_xp_to_smallstreet(
-			array(
-				'confirmation_id' => $confirmation_id,
-				'identity_uuid'   => $identity_uuid,
-				'amount'          => self::XP_AMOUNT,
-				'source'          => 'human_gold_encounter',
+		return 'issued';
+	}
+
+	/**
+	 * Copy issued encounter XP that was stored only as an option into wp_xp_ledger.
+	 * Runs until every issued row with a WordPress user is stored.
+	 */
+	public static function backfill_encounter_xp_ledger(): void {
+		if ( get_option( 'hbc_encounter_xp_ledger_backfill', '' ) === '1' ) {
+			return;
+		}
+		if ( ! class_exists( 'Cpm_Humanblockchain_Xp_Ledger' ) ) {
+			return;
+		}
+
+		global $wpdb;
+		$like = $wpdb->esc_like( 'hbc_xp_' ) . '%';
+		$opts = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$like
 			)
 		);
-		return 'issued';
+
+		$retry = false;
+		foreach ( (array) $opts as $opt ) {
+			$data = maybe_unserialize( $opt->option_value );
+			if ( ! is_array( $data ) ) {
+				continue;
+			}
+			$status = sanitize_key( (string) ( $data['status'] ?? 'issued' ) );
+			if ( 'issued' !== $status ) {
+				continue;
+			}
+			$confirmation_id = substr( (string) $opt->option_name, strlen( 'hbc_xp_' ) );
+			$identity_uuid   = (string) ( $data['identity_uuid'] ?? '' );
+			if ( $confirmation_id === '' || self::wp_user_for_identity( $identity_uuid ) <= 0 ) {
+				continue;
+			}
+			$row_id = self::persist_encounter_xp_row(
+				$confirmation_id,
+				$identity_uuid,
+				(string) ( $data['session_uuid'] ?? '' ),
+				(string) ( $data['amount'] ?? self::XP_AMOUNT ),
+				false
+			);
+			if ( $row_id <= 0 ) {
+				$retry = true;
+			}
+		}
+
+		if ( ! $retry ) {
+			update_option( 'hbc_encounter_xp_ledger_backfill', '1', false );
+		}
+	}
+
+	/**
+	 * @param bool $emit Announce the new row to the GitHub mirror. False for rows already announced.
+	 */
+	private static function persist_encounter_xp_row( string $confirmation_id, string $identity_uuid, string $session_uuid, string $amount, bool $emit ): int {
+		$user_id = self::wp_user_for_identity( $identity_uuid );
+		if ( $user_id <= 0 || ! class_exists( 'Cpm_Humanblockchain_Xp_Ledger' ) ) {
+			return 0;
+		}
+		return Cpm_Humanblockchain_Xp_Ledger::record_encounter_xp(
+			$user_id,
+			$confirmation_id,
+			$amount,
+			array(
+				'identity_uuid' => $identity_uuid,
+				'session_uuid'  => $session_uuid,
+				'emit'          => $emit,
+			)
+		);
 	}
 
 	public static function sweep_orphans(): void {
